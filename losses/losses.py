@@ -77,23 +77,32 @@ class SSIMLoss(nn.Module):
 
 
 class GradientDifferenceLoss(nn.Module):
-    """Gradient Difference Loss for preserving edges and fine details"""
+    """Gradient Difference Loss for preserving edges and fine details
+    Supports both 4D [B, C, H, W] and 5D [B, C, D, H, W] tensors
+    """
     def __init__(self):
         super(GradientDifferenceLoss, self).__init__()
         
     def forward(self, pred, target):
-        # Compute gradients
-        pred_dx = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])
-        pred_dy = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :])
+        if pred.dim() == 5:
+            # 5D tensor: [B, C, D, H, W]
+            # Compute gradients in H and W directions (last two dims)
+            pred_dx = torch.abs(pred[:, :, :, :, 1:] - pred[:, :, :, :, :-1])  # W 방향
+            pred_dy = torch.abs(pred[:, :, :, 1:, :] - pred[:, :, :, :-1, :])  # H 방향
+            
+            target_dx = torch.abs(target[:, :, :, :, 1:] - target[:, :, :, :, :-1])
+            target_dy = torch.abs(target[:, :, :, 1:, :] - target[:, :, :, :-1, :])
+        else:
+            # 4D tensor: [B, C, H, W]
+            pred_dx = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])
+            pred_dy = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :])
+            
+            target_dx = torch.abs(target[:, :, :, 1:] - target[:, :, :, :-1])
+            target_dy = torch.abs(target[:, :, 1:, :] - target[:, :, :-1, :])
         
-        target_dx = torch.abs(target[:, :, :, 1:] - target[:, :, :, :-1])
-        target_dy = torch.abs(target[:, :, 1:, :] - target[:, :, :-1, :])
-        
-        # Compute differences
         dx_diff = torch.abs(pred_dx - target_dx)
         dy_diff = torch.abs(pred_dy - target_dy)
         
-        # Return mean absolute difference
         return dx_diff.mean() + dy_diff.mean()
 
 
@@ -154,30 +163,26 @@ class LPIPSLoss(nn.Module):
 
 
 class StableKLLoss(nn.Module):
-    """Numerically stable KL divergence loss with free bits"""
+    """Numerically stable KL divergence loss with free bits
+    Supports both 4D [B, C, H, W] and 5D [B, C, D, H, W] tensors
+    """
     def __init__(self, free_bits=0.0):
         super().__init__()
         self.free_bits = free_bits
     
     def forward(self, mean, logvar):
-        # KL divergence: -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        # Clamp inputs for extreme stability
         mean = torch.clamp(mean, min=-10, max=10)
         logvar = torch.clamp(logvar, min=-10, max=2)
         
-        # Compute KL term-by-term for better numerical stability
         kl_elementwise = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())
-        
-        # Additional safety: clamp individual KL terms
         kl_elementwise = torch.clamp(kl_elementwise, min=-10, max=10)
         
-        # Apply free bits to prevent KL from going to zero
         if self.free_bits > 0:
             free_bits_tensor = torch.tensor(self.free_bits, dtype=torch.float32, device=kl_elementwise.device)
             kl_elementwise = torch.maximum(kl_elementwise, free_bits_tensor)
         
-        # Take mean over all dimensions except batch
-        kl = kl_elementwise.mean(dim=[1, 2, 3])  # [B]
+        # Dynamic dim: works for both 4D and 5D
+        spatial_dims = list(range(1, kl_elementwise.dim()))  # [1,2,3] for 4D, [1,2,3,4] for 5D
+        kl = kl_elementwise.mean(dim=spatial_dims)  # [B]
         
-        # Average over batch
         return kl.mean()

@@ -1,5 +1,6 @@
 """
-Training functions for VAE, Diffusion, and Consistency models
+Training functions for 3D Slab-based VAE, Diffusion, and Consistency models
+Processes 3-slice windows: [B, 1, D=3, H, W]
 """
 
 import torch
@@ -64,14 +65,6 @@ def check_gradient_health(model, clip_value=1.0, epoch=1, batch_idx=0, debug=Fal
     elif total_norm > warning_threshold and debug and epoch > 5:
         logger.debug(f"Large gradient norm at epoch {epoch}: {total_norm:.2f} (threshold: {warning_threshold:.2f})")
     
-    if debug and layer_norms and (batch_idx % 1000 == 0):
-        logger.debug(f"Layer-wise gradient norms at epoch {epoch}, batch {batch_idx}:")
-        for layer, norms in layer_norms.items():
-            avg_norm = np.mean(norms)
-            max_norm = np.max(norms)
-            if avg_norm > 1.0:
-                logger.debug(f"  - {layer}: avg={avg_norm:.3f}, max={max_norm:.3f}")
-    
     return {
         'total_norm': total_norm,
         'has_nan': has_nan,
@@ -83,10 +76,45 @@ def check_gradient_health(model, clip_value=1.0, epoch=1, batch_idx=0, debug=Fal
     }
 
 
+def compute_3d_loss(pred, target, mid_weight=0.5):
+    """
+    Compute loss for 3D volumes with optional mid-slice weighting
+    
+    Args:
+        pred: [B, 1, D=3, H, W] - predicted volume
+        target: [B, 1, D=3, H, W] - target volume
+        mid_weight: Weight for middle slice (0.5 = equal weighting)
+    
+    Returns:
+        Weighted MSE loss
+    """
+    # Base MSE on all slices
+    mse_all = F.mse_loss(pred, target, reduction='none')
+    
+    if mid_weight != 1/3:
+        # Apply slice-wise weighting: [prev, mid, next]
+        # mid_weight for middle, (1-mid_weight)/2 for sides
+        side_weight = (1 - mid_weight) / 2
+        weights = torch.tensor([side_weight, mid_weight, side_weight], 
+                              device=pred.device, dtype=pred.dtype)
+        # Reshape for broadcasting: [1, 1, 3, 1, 1]
+        weights = weights.view(1, 1, 3, 1, 1)
+        
+        # Apply weights
+        mse_weighted = mse_all * weights
+        return mse_weighted.sum() / (weights.sum() * pred.shape[0] * pred.shape[3] * pred.shape[4])
+    else:
+        return mse_all.mean()
+
+
 def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, config, metrics_tracker, 
               lpips_loss_fn=None, lpips_weight=0.1, scaler=None, accumulation_steps=1,
               gpu_augmenter=None):
-    """Optimized VAE training with async prefetching and GPU augmentation"""
+    """
+    Optimized 3D VAE training with async prefetching and GPU augmentation
+    
+    Processes 3-slice windows: [B, 1, D=3, H, W]
+    """
     vae.train()
     total_loss = 0
     recon_losses = []
@@ -97,8 +125,12 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     kl_loss_fn = StableKLLoss(free_bits=config['vae'].get('free_bits', 0.0))
     grad_clip_value = config['training'].get('grad_clip', 0.8)
     
+    # Mid-slice weight (higher = more focus on middle slice quality)
+    mid_weight = config['vae'].get('mid_slice_weight', 0.5)
+    
     optimizer.zero_grad()
     
+    # KL annealing schedule
     if epoch <= 20:
         beta = 0.0
     elif epoch <= 40:
@@ -121,20 +153,34 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
         except StopIteration:
             break
         
-        ct_slice = batch['ct_slice']
+        # Get 3D CT volume: [B, 1, D=3, H, W]
+        ct_volume = batch['ct_volume']
+        
+        # Ensure correct shape for 3D VAE
+        if ct_volume.dim() == 4:
+            # [B, 3, H, W] -> [B, 1, 3, H, W]
+            ct_volume = ct_volume.unsqueeze(1)
+        
+        # Permute if needed: [B, 1, 3, H, W] is correct for 3D VAE
+        # where 3 is the depth dimension
         
         if gpu_augmenter is not None and dataloader.dataset.augment:
-            ct_slice, _ = gpu_augmenter(ct_slice, None, epoch=epoch)
+            # GPU augmentation for 3D data
+            # Note: may need to adapt gpu_augmenter for 3D
+            ct_volume_2d = ct_volume.squeeze(1)  # [B, 3, H, W] treat depth as channels
+            ct_volume_2d, _ = gpu_augmenter(ct_volume_2d, None, epoch=epoch)
+            ct_volume = ct_volume_2d.unsqueeze(1)  # [B, 1, 3, H, W]
         
-        if torch.isnan(ct_slice).any() or torch.isinf(ct_slice).any():
-            logger.warning(f"NaN/Inf detected in input at batch {i}, folder: {batch.get('folder', ['unknown'])[0]}, skipping")
+        if torch.isnan(ct_volume).any() or torch.isinf(ct_volume).any():
+            logger.warning(f"NaN/Inf detected in input at batch {i}, skipping")
             continue
         
         grad_norm = torch.tensor(0.0)
         
         try:
             with torch.amp.autocast(device_type='cuda', enabled=scaler is not None):
-                recon, mean, logvar = vae(ct_slice)
+                # Forward pass through 3D VAE
+                recon, mean, logvar = vae(ct_volume)
                 
                 if torch.isnan(recon).any() or torch.isinf(recon).any():
                     logger.warning(f"NaN/Inf in reconstruction at batch {i}")
@@ -148,13 +194,19 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     logger.warning(f"NaN/Inf in logvar at batch {i}")
                     continue
                 
-                recon_loss = F.mse_loss(recon, ct_slice, reduction='mean')
+                # Reconstruction loss with mid-slice weighting
+                recon_loss = compute_3d_loss(recon, ct_volume, mid_weight=mid_weight)
                 recon_loss = torch.maximum(recon_loss, torch.tensor(1e-6, device=device))
                 
+                # KL loss
                 kl_loss = kl_loss_fn(mean, logvar)
                 
+                # LPIPS loss (on middle slice for efficiency)
                 if lpips_loss_fn is not None and lpips_weight > 0 and epoch > 20:
-                    lpips_loss = lpips_loss_fn(recon, ct_slice)
+                    # Extract middle slice: [B, 1, H, W]
+                    recon_mid = recon[:, :, 1, :, :]
+                    target_mid = ct_volume[:, :, 1, :, :]
+                    lpips_loss = lpips_loss_fn(recon_mid, target_mid)
                     loss = recon_loss + beta * kl_loss + lpips_weight * lpips_loss
                     lpips_losses.append(lpips_loss.item())
                 else:
@@ -164,7 +216,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                 loss = loss / accumulation_steps
                 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning(f"Invalid loss at batch {i}: loss={loss.item()}, recon={recon_loss.item()}, kl={kl_loss.item()}")
+                    logger.warning(f"Invalid loss at batch {i}")
                     continue
         
         except Exception as e:
@@ -186,8 +238,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     gradient_overflow_count += 1
                 
                 if grad_info['is_critical']:
-                    logger.warning(f"Critical gradient issues at batch {i}: "
-                                 f"nan={grad_info['has_nan']}, inf={grad_info['has_inf']}")
+                    logger.warning(f"Critical gradient issues at batch {i}")
                     optimizer.zero_grad()
                     scaler.update()
                     skipped_steps += 1
@@ -206,8 +257,6 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     gradient_overflow_count += 1
                 
                 if grad_info['is_critical']:
-                    logger.warning(f"Critical gradient issues at batch {i}: "
-                                 f"nan={grad_info['has_nan']}, inf={grad_info['has_inf']}")
                     optimizer.zero_grad()
                     skipped_steps += 1
                     continue
@@ -218,18 +267,6 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     scheduler.step()
             
             optimizer.zero_grad()
-        else:
-            if scaler is not None:
-                with torch.no_grad():
-                    total_norm = 0
-                    for p in vae.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.data.norm(2)
-                            total_norm += param_norm.item() ** 2
-                    grad_norm = torch.tensor((total_norm ** 0.5) / scaler.get_scale())
-            else:
-                with torch.no_grad():
-                    grad_norm = torch.nn.utils.clip_grad_norm_(vae.parameters(), float('inf'))
         
         actual_loss = loss.item() * accumulation_steps
         total_loss += actual_loss
@@ -288,7 +325,11 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                    l1_weight=0.5, gdl_weight=0.5, lpips_weight=0.1, scaler=None, ema_wrapper=None,
                    accumulation_steps=1, use_amp=True, autocast_dtype=torch.float16,
                    gpu_augmenter=None):
-    """Optimized diffusion training with v-param, self-conditioning, and CFG"""
+    """
+    Optimized 3D diffusion training with v-param, self-conditioning, and CFG
+    
+    Processes 3D latent volumes: [B, C, D=3, h, w]
+    """
     diffusion_model.train()
     vae.eval()
     
@@ -303,7 +344,10 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     
     grad_clip_value = config['training'].get('grad_clip', 0.8)
     
-    # MSE FIX: Adjusted thresholds
+    # Mid-slice weight for loss
+    mid_weight = config['diffusion'].get('mid_slice_weight', 0.5)
+    
+    # MSE threshold for warnings
     high_mse_threshold = 1.2
     ignore_epochs = 3
     
@@ -331,22 +375,32 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         except StopIteration:
             break
         
-        condition = batch['condition']
-        ct_slice = batch['ct_slice']
+        # Get data
+        condition = batch['condition']  # [B, 3, H, W] - 3-channel panorama
+        ct_volume = batch['ct_volume']  # [B, 1, D=3, H, W]
         slice_position = batch.get('slice_position', None)
         
+        # Ensure correct shape
+        if ct_volume.dim() == 4:
+            ct_volume = ct_volume.unsqueeze(1)
+        
         if gpu_augmenter is not None and dataloader.dataset.augment:
-            ct_slice, condition = gpu_augmenter(ct_slice, condition, epoch=epoch)
+            # Augment (treating depth as channels for 2D augmenter)
+            ct_volume_2d = ct_volume.squeeze(1)  # [B, 3, H, W]
+            ct_volume_2d, condition = gpu_augmenter(ct_volume_2d, condition, epoch=epoch)
+            ct_volume = ct_volume_2d.unsqueeze(1)  # [B, 1, 3, H, W]
         
         if torch.isnan(condition).any() or torch.isinf(condition).any() or \
-           torch.isnan(ct_slice).any() or torch.isinf(ct_slice).any():
+           torch.isnan(ct_volume).any() or torch.isinf(ct_volume).any():
             logger.warning(f"NaN/Inf detected in input at batch {i}, skipping")
             nan_count += 1
             continue
         
+        # Encode CT volume to 3D latent
         with torch.no_grad():
-            mean, logvar = vae.encoder(ct_slice)
-            z = mean  # Deterministic target (no sampling)
+            mean, logvar = vae.encoder(ct_volume)
+            z = mean  # Deterministic encoding (no sampling noise)
+            # z shape: [B, z_channels, D=3, h, w]
             
             if torch.isnan(z).any() or torch.isinf(z).any():
                 logger.warning(f"NaN/Inf in VAE encoding at batch {i}, skipping")
@@ -401,24 +455,21 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 else:
                     raise ValueError(f"Unknown prediction type: {diffusion_process.prediction_type}")
                 
-                # MSE loss on the prediction
+                # MSE loss on the prediction (with mid-slice weighting for 3D)
+                # Treat z as [B, C, D, H, W] -> average over all dims
                 mse_loss = F.mse_loss(model_output, target)
                 
-                # MSE FIX: Only warn after ignore_epochs and with higher threshold
+                # Warning for high MSE
                 if epoch > ignore_epochs and mse_loss.item() > high_mse_threshold:
                     high_loss_count += 1
-                    logger.warning(f"Batch {i}: MSE {mse_loss.item():.4f} is above threshold "
-                                 f"(>{high_mse_threshold}). This can indicate augmentation or "
-                                 f"conditioning issues.")
-                    
-                    if high_loss_count == 1 and epoch > ignore_epochs:
+                    if high_loss_count == 1:
                         debug_dir = os.path.join(config['save_dir'], 'debug_high_loss')
                         os.makedirs(debug_dir, exist_ok=True)
                         torch.save({
-                            'condition': condition,
-                            'ct_slice': ct_slice,
-                            'model_output': model_output,
-                            'target': target,
+                            'condition': condition.cpu(),
+                            'ct_volume': ct_volume.cpu(),
+                            'model_output': model_output.cpu(),
+                            'target': target.cpu(),
                             'epoch': epoch,
                             'batch': i,
                             'mse_loss': mse_loss.item()
@@ -434,6 +485,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 
                 x0_pred = torch.clamp(x0_pred, -1, 1)
                 
+                # Decode predicted latent to image space
                 decoded_pred = vae.decode(x0_pred)
                 decoded_pred = torch.clamp(decoded_pred, -1, 1)
                 
@@ -443,14 +495,19 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                     optimizer.zero_grad()
                     continue
                 
-                l1_loss = l1_loss_fn(decoded_pred, ct_slice) if l1_weight > 0 else torch.tensor(0.0, device=device)
-                gdl_loss = gdl_loss_fn(decoded_pred, ct_slice) if gdl_weight > 0 else torch.tensor(0.0, device=device)
-                lpips_loss = lpips_loss_fn(decoded_pred, ct_slice) if lpips_weight > 0 else torch.tensor(0.0, device=device)
+                # Perceptual losses on middle slice for efficiency
+                # decoded_pred: [B, 1, D=3, H, W], ct_volume: [B, 1, D=3, H, W]
+                decoded_mid = decoded_pred[:, :, 1, :, :]  # [B, 1, H, W]
+                target_mid = ct_volume[:, :, 1, :, :]  # [B, 1, H, W]
+                
+                l1_loss = l1_loss_fn(decoded_mid, target_mid) if l1_weight > 0 else torch.tensor(0.0, device=device)
+                gdl_loss = gdl_loss_fn(decoded_mid, target_mid) if gdl_weight > 0 else torch.tensor(0.0, device=device)
+                lpips_loss = lpips_loss_fn(decoded_mid, target_mid) if lpips_weight > 0 else torch.tensor(0.0, device=device)
                 
                 loss = mse_loss + l1_weight * l1_loss + gdl_weight * gdl_loss + lpips_weight * lpips_loss
                 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    logger.warning(f"NaN/Inf in loss at batch {i}: mse={mse_loss.item()}, l1={l1_loss.item()}, gdl={gdl_loss.item()}, lpips={lpips_loss.item()}")
+                    logger.warning(f"NaN/Inf in loss at batch {i}")
                     nan_count += 1
                     optimizer.zero_grad()
                     continue
@@ -478,8 +535,6 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                     gradient_overflow_count += 1
                 
                 if grad_info['is_critical']:
-                    logger.warning(f"Critical gradient issues at batch {i}: "
-                                 f"nan={grad_info['has_nan']}, inf={grad_info['has_inf']}")
                     optimizer.zero_grad()
                     scaler.update()
                     skipped_steps += 1
@@ -499,8 +554,6 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                     gradient_overflow_count += 1
                 
                 if grad_info['is_critical']:
-                    logger.warning(f"Critical gradient issues at batch {i}: "
-                                 f"nan={grad_info['has_nan']}, inf={grad_info['has_inf']}")
                     optimizer.zero_grad()
                     skipped_steps += 1
                     continue
@@ -514,22 +567,6 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
             
             if ema_wrapper is not None:
                 ema_wrapper.update()
-        else:
-            if scaler is not None:
-                with torch.no_grad():
-                    total_norm = 0
-                    scale = scaler.get_scale()
-                    if scale > 0:
-                        for p in diffusion_model.parameters():
-                            if p.grad is not None:
-                                param_norm = (p.grad.data.float() / scale).norm(2)
-                                total_norm += param_norm.item() ** 2
-                        grad_norm = math.sqrt(total_norm)
-                    else:
-                        grad_norm = 0.0
-            else:
-                with torch.no_grad():
-                    grad_norm = torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), float('inf'))
         
         actual_loss = loss.item() * accumulation_steps
         total_loss += actual_loss
@@ -568,14 +605,10 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     if nan_count > 0:
         nan_rate = nan_count / len(dataloader) * 100
         logger.warning(f"NaN/Inf detected in {nan_count} batches ({nan_rate:.2f}%)")
-        if nan_rate > 10:
-            logger.error("High NaN rate detected! Consider reducing learning rate or disabling AMP")
     
     if high_loss_count > 0 and epoch > ignore_epochs:
         high_loss_rate = high_loss_count / len(dataloader) * 100
-        logger.info(f"High MSE loss (>{high_mse_threshold}) detected in {high_loss_count} batches ({high_loss_rate:.2f}%)")
-        if high_loss_rate > 50 and epoch > 10:
-            logger.error("CRITICAL: Over 50% of batches have high MSE loss after warmup! Check augmentation alignment.")
+        logger.info(f"High MSE loss (>{high_mse_threshold}) in {high_loss_count} batches ({high_loss_rate:.2f}%)")
     
     avg_loss = total_loss / len(dataloader)
     avg_mse = np.mean(mse_losses)
@@ -613,7 +646,12 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
 def train_consistency_3d(consistency_net, vae, diffusion_model, diffusion_process, 
                         dataloader, optimizer, device, epoch, config, num_slices, metrics_tracker,
                         teacher_forcing_ratio=0.5, ema_wrapper=None):
-    """Train 3D consistency network with teacher forcing"""
+    """
+    Train 3D consistency network with teacher forcing
+    
+    For 3D slab approach, this refines the generated 3-slice windows
+    to ensure z-axis consistency
+    """
     consistency_net.train()
     vae.eval()
     
@@ -640,74 +678,39 @@ def train_consistency_3d(consistency_net, vae, diffusion_model, diffusion_proces
         except StopIteration:
             break
             
-        condition = batch['condition']
-        volume_idx = batch['volume_idx'][0].item()
-        folder = batch['folder'][0]
+        condition = batch['condition']  # [B, 3, H, W]
+        ct_volume = batch['ct_volume']  # [B, 1, D=3, H, W]
+        slice_position = batch.get('slice_position', None)
         
-        generated_slices = []
-        target_slices = []
+        if ct_volume.dim() == 4:
+            ct_volume = ct_volume.unsqueeze(1)
         
+        # For consistency training, we generate the 3-slice window and refine it
         with torch.no_grad():
-            latent_h, latent_w = vae.get_latent_shape((200, 200))
-            
-            start_idx, end_idx = dataloader.dataset.slice_range
-            slice_indices = np.linspace(
-                start_idx, 
-                end_idx - 1,
-                num_slices, 
-                dtype=int
-            )
-            
-            for j, slice_idx in enumerate(slice_indices):
-                relative_slice_idx = slice_idx - start_idx
-                absolute_idx = volume_idx * dataloader.dataset.slices_per_volume + relative_slice_idx
+            # Use teacher forcing or generate from diffusion
+            if np.random.rand() < teacher_forcing_ratio:
+                # Use ground truth
+                generated_volume = ct_volume
+            else:
+                # Generate from diffusion
+                latent_shape = vae.get_latent_shape((3, 200, 200))
+                z_shape = (ct_volume.shape[0], vae.z_channels, *latent_shape)
                 
-                if absolute_idx >= len(dataloader.dataset):
-                    logger.warning(f"Slice index {absolute_idx} out of range, skipping")
-                    continue
-                
-                if np.random.rand() < teacher_forcing_ratio:
-                    try:
-                        slice_data = dataloader.dataset[absolute_idx]
-                        gt_slice = slice_data['ct_slice'].unsqueeze(0).to(device)
-                        
-                        if torch.isnan(gt_slice).any() or torch.isinf(gt_slice).any():
-                            logger.warning(f"NaN/Inf in ground truth slice {absolute_idx}, skipping")
-                            continue
-                            
-                        target_slices.append(gt_slice)
-                        generated_slices.append(gt_slice)
-                    except Exception as e:
-                        logger.warning(f"Error getting slice {absolute_idx}: {e}")
-                    continue
-                
-                try:
-                    slice_data = dataloader.dataset[absolute_idx]
-                    slice_condition = slice_data['condition'].unsqueeze(0).to(device)
-                    
-                    latent_shape = (1, vae.z_channels, latent_h, latent_w)
-                    z = diffusion_process.p_sample_loop(eval_model, latent_shape, slice_condition, device)
-                    slice_img = vae.decode(z)
-                    generated_slices.append(slice_img)
-                    
-                    target_slices.append(slice_data['ct_slice'].unsqueeze(0).to(device))
-                except Exception as e:
-                    logger.warning(f"Error generating slice {absolute_idx}: {e}")
-        
-        if len(target_slices) < num_slices // 2:
-            logger.warning(f"Not enough slices for volume {volume_idx}, skipping")
-            continue
-        
-        generated_volume = torch.cat(generated_slices, dim=0).unsqueeze(0)
-        generated_volume = generated_volume.permute(0, 2, 1, 3, 4)
-        
-        target_volume = torch.cat(target_slices, dim=0).unsqueeze(0)
-        target_volume = target_volume.permute(0, 2, 1, 3, 4)
+                z_gen = diffusion_process.p_sample_loop(
+                    eval_model, z_shape, condition, device,
+                    slice_pos=slice_position, show_progress=False
+                )
+                generated_volume = vae.decode(z_gen)
+                generated_volume = torch.clamp(generated_volume, -1, 1)
         
         optimizer.zero_grad()
+        
+        # Refine the generated volume
+        # consistency_net expects [B, 1, D, H, W]
         refined_volume = consistency_net(generated_volume)
         
-        loss = F.mse_loss(refined_volume, target_volume)
+        # Loss against ground truth
+        loss = F.mse_loss(refined_volume, ct_volume)
         
         loss.backward()
         torch.nn.utils.clip_grad_norm_(consistency_net.parameters(), grad_clip_value)

@@ -1,6 +1,11 @@
 """
 Training functions for 3D Slab-based VAE, Diffusion, and Consistency models
 Processes 3-slice windows: [B, 1, D=3, H, W]
+
+FIXES APPLIED:
+1. Latent Scaling - scale_factor 적용 (기본값 0.18215, Stable Diffusion 표준)
+2. VAE Sampling - mean 대신 sample(mean, logvar) 사용
+3. Decode 전 Rescaling 적용
 """
 
 import torch
@@ -329,6 +334,11 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     Optimized 3D diffusion training with v-param, self-conditioning, and CFG
     
     Processes 3D latent volumes: [B, C, D=3, h, w]
+    
+    FIXES APPLIED:
+    1. Scale factor 적용 (기본값 0.18215)
+    2. VAE sampling 사용 (mean 대신 sample(mean, logvar))
+    3. Decode 전 rescaling 적용
     """
     diffusion_model.train()
     vae.eval()
@@ -346,6 +356,14 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     
     # Mid-slice weight for loss
     mid_weight = config['diffusion'].get('mid_slice_weight', 0.5)
+    
+    # ============================================================
+    # FIX 1: Scale Factor 적용
+    # Stable Diffusion 표준값 0.18215 사용
+    # 또는 config에서 지정 가능 (VAE 학습 후 latent std의 역수로 설정 권장)
+    # ============================================================
+    scale_factor = config['model'].get('scale_factor', 0.18215)
+    logger.info(f"Using latent scale factor: {scale_factor}")
     
     # MSE threshold for warnings
     high_mse_threshold = 1.2
@@ -396,10 +414,23 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
             nan_count += 1
             continue
         
-        # Encode CT volume to 3D latent
+        # ============================================================
+        # FIX 2: VAE Sampling 사용 (mean 대신 sample(mean, logvar))
+        # Deterministic encoding 대신 확률적 sampling으로 변경
+        # ============================================================
         with torch.no_grad():
             mean, logvar = vae.encoder(ct_volume)
-            z = mean  # Deterministic encoding (no sampling noise)
+            
+            # 기존: z = mean (deterministic, 다양성 부족)
+            # 수정: z = sample(mean, logvar) (stochastic, 더 robust한 학습)
+            z = vae.sample(mean, logvar)
+            
+            # ============================================================
+            # FIX 1 적용: Scale Factor 곱하기
+            # Latent를 표준 정규 분포에 가깝게 만들어 Diffusion 학습 안정화
+            # ============================================================
+            z = z * scale_factor
+            
             # z shape: [B, z_channels, D=3, h, w]
             
             if torch.isnan(z).any() or torch.isinf(z).any():
@@ -485,8 +516,14 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 
                 x0_pred = torch.clamp(x0_pred, -1, 1)
                 
+                # ============================================================
+                # FIX 3: Decode 전 Rescaling 적용
+                # Latent를 원래 스케일로 복원 후 디코딩
+                # ============================================================
+                x0_pred_rescaled = x0_pred / scale_factor
+                
                 # Decode predicted latent to image space
-                decoded_pred = vae.decode(x0_pred)
+                decoded_pred = vae.decode(x0_pred_rescaled)
                 decoded_pred = torch.clamp(decoded_pred, -1, 1)
                 
                 if torch.isnan(decoded_pred).any() or torch.isinf(decoded_pred).any():
@@ -638,7 +675,8 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
                             nan_count=nan_count,
-                            high_loss_count=high_loss_count)
+                            high_loss_count=high_loss_count,
+                            scale_factor=scale_factor)  # Log scale factor
     
     return avg_loss
 
@@ -665,6 +703,9 @@ def train_consistency_3d(consistency_net, vae, diffusion_model, diffusion_proces
     total_loss = 0
     
     grad_clip_value = config['training'].get('grad_clip', 0.8)
+    
+    # Scale factor for consistency with diffusion training
+    scale_factor = config['model'].get('scale_factor', 0.18215)
     
     num_batches = min(10, len(dataloader))
     
@@ -700,7 +741,11 @@ def train_consistency_3d(consistency_net, vae, diffusion_model, diffusion_proces
                     eval_model, z_shape, condition, device,
                     slice_pos=slice_position, show_progress=False
                 )
-                generated_volume = vae.decode(z_gen)
+                
+                # Rescale before decoding
+                z_gen_rescaled = z_gen / scale_factor
+                
+                generated_volume = vae.decode(z_gen_rescaled)
                 generated_volume = torch.clamp(generated_volume, -1, 1)
         
         optimizer.zero_grad()

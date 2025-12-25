@@ -4,6 +4,10 @@ Main training script with 3D VAE, 3D UNet, v-param, self-conditioning, and CFG
 
 Processes 3-slice windows: [B, 1, D=3, H, W]
 Generates 3 slices simultaneously for improved z-axis consistency
+
+FIXES APPLIED:
+1. GPU Augmentation 사용 시 CPU Augmentation 비활성화
+2. Scale factor 설정 추가 (config['model']['scale_factor'])
 """
 
 import torch
@@ -51,6 +55,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def compute_latent_scale_factor(vae, dataloader, device, num_samples=100):
+    """
+    VAE 학습 후 latent의 표준편차를 계산하여 scale_factor 결정
+    
+    Stable Diffusion 방식: scale_factor = 1 / std(latent)
+    이렇게 하면 scaled latent가 대략 N(0, 1)에 가까워짐
+    
+    Args:
+        vae: 학습된 VAE 모델
+        dataloader: 데이터 로더
+        device: 장치
+        num_samples: 샘플링할 배치 수
+    
+    Returns:
+        scale_factor: 계산된 스케일 팩터
+    """
+    vae.eval()
+    latents = []
+    
+    with torch.no_grad():
+        for i, batch in enumerate(dataloader):
+            if i >= num_samples:
+                break
+            
+            ct_volume = batch['ct_volume'].to(device)
+            if ct_volume.dim() == 4:
+                ct_volume = ct_volume.unsqueeze(1)
+            
+            mean, logvar = vae.encoder(ct_volume)
+            z = vae.sample(mean, logvar)
+            latents.append(z.cpu())
+    
+    all_latents = torch.cat(latents, dim=0)
+    latent_std = all_latents.std().item()
+    
+    # 1/std로 scale_factor 계산 (Stable Diffusion 방식)
+    scale_factor = 1.0 / latent_std
+    
+    logger.info(f"Computed latent statistics:")
+    logger.info(f"  Mean: {all_latents.mean().item():.4f}")
+    logger.info(f"  Std: {latent_std:.4f}")
+    logger.info(f"  Scale factor (1/std): {scale_factor:.4f}")
+    
+    return scale_factor
+
+
 def main(args):
     # Load configuration
     if args.config:
@@ -89,7 +139,14 @@ def main(args):
                 'z_channels': args.z_channels,
                 'vae_channels': args.vae_channels,
                 'diffusion_channels': args.diffusion_channels,
-                'cond_channels': args.cond_channels
+                'cond_channels': args.cond_channels,
+                # ============================================================
+                # FIX 1: Scale factor 설정 추가
+                # 기본값 0.18215 (Stable Diffusion 표준)
+                # --auto_scale_factor 사용 시 VAE 학습 후 자동 계산
+                # ============================================================
+                'scale_factor': args.scale_factor,
+                'auto_scale_factor': args.auto_scale_factor
             },
             'diffusion': {
                 'num_timesteps': args.num_timesteps,
@@ -210,18 +267,39 @@ def main(args):
     logger.info("  - Reduced slice-to-slice artifacts")
     logger.info("="*60 + "\n")
     
+    # ============================================================
+    # FIX 2: GPU Augmentation 사용 시 CPU Augmentation 비활성화 결정
+    # ============================================================
+    from data.augmentation import KORNIA_AVAILABLE
+    
+    use_gpu_aug = config['data']['use_gpu_augmentation'] and KORNIA_AVAILABLE
+    
+    # CPU augmentation 플래그 결정
+    if use_gpu_aug:
+        logger.info("="*60)
+        logger.info("AUGMENTATION CONFLICT PREVENTION")
+        logger.info("="*60)
+        logger.info("GPU Augmentation enabled -> Disabling heavy CPU augmentation")
+        logger.info("to avoid double distortion (데이터 분포 망가짐 방지)")
+        logger.info("="*60 + "\n")
+        train_augment_cpu = False
+    else:
+        train_augment_cpu = True
+    
     # Log optimization settings
     logger.info("\n" + "="*60)
     logger.info("Performance Optimizations Enabled:")
     logger.info("="*60)
     logger.info(f"- Volume caching: {config['data']['cache_volumes']}")
-    from data.augmentation import KORNIA_AVAILABLE
-    logger.info(f"- GPU augmentation: {config['data']['use_gpu_augmentation'] and KORNIA_AVAILABLE}")
+    logger.info(f"- GPU augmentation: {use_gpu_aug}")
+    logger.info(f"- CPU augmentation: {train_augment_cpu}")
     logger.info(f"- Async data prefetching: Enabled")
     logger.info(f"- Memory-mapped I/O: {config['data']['use_memmap']}")
     logger.info(f"- Flash Attention: {flash_enabled}")
     logger.info(f"- Gradient accumulation: {config['training']['gradient_accumulation_steps']} steps")
     logger.info(f"- Augmentation starts from epoch: {config['data']['augment_from_epoch']}")
+    logger.info(f"- Latent scale factor: {config['model']['scale_factor']}")
+    logger.info(f"- Auto compute scale factor: {config['model'].get('auto_scale_factor', False)}")
     logger.info("="*60 + "\n")
     
     # Log model configuration
@@ -361,19 +439,22 @@ def main(args):
     
     # GPU augmentation
     gpu_augmenter = None
-    if config['data']['use_gpu_augmentation'] and KORNIA_AVAILABLE:
+    if use_gpu_aug:
         gpu_augmenter = GPUAugmentation(config['data']['augmentation'], device).to(device)
         logger.info("GPU augmentation module initialized")
     
-    # Create datasets (3D Slab mode)
+    # ============================================================
+    # FIX 2 적용: GPU augmentation 사용 시 CPU augmentation 비활성화
+    # train_augment_cpu 플래그 사용
+    # ============================================================
     train_dataset = OptimizedDentalSliceDataset(
         config['data']['data_dir'], 
         train_folders, 
         slice_range=config['data']['slice_range'],
-        augment=True,
+        augment=train_augment_cpu,  # GPU aug 사용 시 False
         panorama_type=config['data']['panorama_type'],
         normalize_volumes=config['data']['normalize_volumes'],
-        augment_config=config['data']['augmentation'],
+        augment_config=config['data']['augmentation'] if train_augment_cpu else None,
         pano_triplet=True,  # Always True for 3D Slab
         cache_volumes=config['data']['cache_volumes'],
         use_memmap=config['data'].get('use_memmap', True)
@@ -393,6 +474,8 @@ def main(args):
     
     logger.info(f"Train dataset size: {len(train_dataset)} samples (3-slice windows)")
     logger.info(f"Val dataset size: {len(val_dataset)} samples (3-slice windows)")
+    logger.info(f"Train CPU augmentation: {train_augment_cpu}")
+    logger.info(f"Train GPU augmentation: {use_gpu_aug}")
     
     # Windows multiprocessing check
     if os.name == 'nt' and config['training']['num_workers'] > 0:
@@ -603,8 +686,39 @@ def main(args):
             
             if epoch % 10 == 0:
                 torch.cuda.empty_cache()
+        
+        # ============================================================
+        # FIX 1: VAE 학습 완료 후 Scale Factor 자동 계산 (옵션)
+        # ============================================================
+        if config['model'].get('auto_scale_factor', False):
+            logger.info("\n" + "="*60)
+            logger.info("Computing Latent Scale Factor from trained VAE...")
+            logger.info("="*60)
+            
+            computed_scale_factor = compute_latent_scale_factor(
+                vae, train_loader, device, num_samples=100
+            )
+            
+            # Config 업데이트
+            config['model']['scale_factor'] = computed_scale_factor
+            
+            # Config 파일 다시 저장
+            save_config(config, save_dir)
+            
+            logger.info(f"Updated scale_factor in config: {computed_scale_factor:.4f}")
+            logger.info("="*60 + "\n")
     else:
         logger.info("\n=== Skipping VAE Training (Using loaded checkpoint) ===")
+        
+        # VAE가 이미 학습된 경우에도 scale factor 계산 옵션
+        if config['model'].get('auto_scale_factor', False):
+            logger.info("Computing scale factor from loaded VAE...")
+            computed_scale_factor = compute_latent_scale_factor(
+                vae, train_loader, device, num_samples=100
+            )
+            config['model']['scale_factor'] = computed_scale_factor
+            save_config(config, save_dir)
+            logger.info(f"Computed scale_factor: {computed_scale_factor:.4f}")
     
     # =========================================================================
     # Training Phase 2: 3D Diffusion
@@ -618,6 +732,7 @@ def main(args):
     logger.info(f"CFG dropout: {config['diffusion']['cfg_dropout_prob']}")
     logger.info(f"Guidance scale: {config['diffusion']['guidance_scale']}")
     logger.info(f"Mid-slice weight: {config['diffusion']['mid_slice_weight']}")
+    logger.info(f"Latent scale factor: {config['model']['scale_factor']}")
     logger.info(f"Total epochs: {config['training']['diffusion_epochs']}")
     if diffusion_start_epoch > 1:
         logger.info(f"Resuming from epoch: {diffusion_start_epoch}")
@@ -739,6 +854,7 @@ def main(args):
     logger.info("="*60)
     logger.info(f"Output directory: {save_dir}")
     logger.info(f"Final model saved at: {os.path.join(save_dir, 'checkpoints', 'final_model.pth')}")
+    logger.info(f"Scale factor used: {config['model']['scale_factor']}")
     
     if torch.cuda.is_available():
         max_memory = torch.cuda.max_memory_allocated() / 1024**3
@@ -799,6 +915,14 @@ if __name__ == '__main__':
     parser.add_argument('--vae_channels', type=int, default=64)
     parser.add_argument('--diffusion_channels', type=int, default=128)
     parser.add_argument('--cond_channels', type=int, default=512)
+    
+    # ============================================================
+    # FIX: Scale factor 인자 추가
+    # ============================================================
+    parser.add_argument('--scale_factor', type=float, default=0.18215,
+                       help='Latent scaling factor (default: 0.18215, Stable Diffusion standard)')
+    parser.add_argument('--auto_scale_factor', action='store_true', default=False,
+                       help='Automatically compute scale factor from VAE after training')
     
     # Diffusion arguments
     parser.add_argument('--num_timesteps', type=int, default=1000)

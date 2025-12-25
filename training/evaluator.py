@@ -1,6 +1,9 @@
 """
 Model evaluation and visualization functions for 3D Slab-based generation
 Evaluates 3-slice windows: [B, 1, D=3, H, W]
+
+FIXES APPLIED:
+1. Scale factor 적용 - diffusion 생성물 decode 시 rescaling
 """
 
 import torch
@@ -250,7 +253,8 @@ def visualize_vae_3d(recon_volume, target_volume, save_path, metrics=None):
 
 def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader, 
                           device, epoch, save_dir, phase_name, metrics_tracker, ema_wrapper=None,
-                          guidance_scale=1.5, fixed_slice_indices=[20, 40, 60, 80, 100]):
+                          guidance_scale=1.5, fixed_slice_indices=[20, 40, 60, 80, 100],
+                          scale_factor=0.18215):
     """
     Comprehensive evaluation and visualization for 3D Slab models
     
@@ -267,6 +271,7 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
         ema_wrapper: Optional EMA wrapper for diffusion model
         guidance_scale: CFG scale for diffusion
         fixed_slice_indices: Specific indices to evaluate
+        scale_factor: Latent scaling factor (default: 0.18215)
     """
     vae.eval()
     
@@ -344,8 +349,13 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
                         show_progress=False
                     )
                     
+                    # ============================================================
+                    # FIX: Decode 전 Rescaling 적용
+                    # ============================================================
+                    z_gen_rescaled = z_gen / scale_factor
+                    
                     # Decode
-                    gen_volume = vae.decode(z_gen)
+                    gen_volume = vae.decode(z_gen_rescaled)
                     gen_volume = torch.clamp(gen_volume, -1, 1)
                     
                     metrics = compute_metrics_3d(gen_volume, ct_volume)
@@ -406,7 +416,12 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
                             show_progress=False
                         )
                         
-                        gen_volume = vae.decode(z_gen)
+                        # ============================================================
+                        # FIX: Decode 전 Rescaling 적용
+                        # ============================================================
+                        z_gen_rescaled = z_gen / scale_factor
+                        
+                        gen_volume = vae.decode(z_gen_rescaled)
                         gen_volume = torch.clamp(gen_volume, -1, 1)
                         
                         metrics = compute_metrics_3d(gen_volume, ct_volume)
@@ -464,6 +479,7 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
         logger.info(f"Next PSNR: {avg_metrics.get('next_psnr', 0):.2f} dB, SSIM: {avg_metrics.get('next_ssim', 0):.3f}")
         if phase_name != 'vae' and guidance_scale != 1.0:
             logger.info(f"CFG Scale: {guidance_scale}")
+        logger.info(f"Scale Factor: {scale_factor}")
         logger.info(f"{'='*60}\n")
         
         # Save metrics to file
@@ -473,11 +489,12 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
             f.write("="*50 + "\n\n")
             for key, value in avg_metrics.items():
                 f.write(f"{key}: {value:.4f}\n")
+            f.write(f"\nScale Factor: {scale_factor}\n")
 
 
 def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume, 
                            device, slice_range=(0, 120), guidance_scale=1.5,
-                           ema_wrapper=None, save_dir=None):
+                           ema_wrapper=None, save_dir=None, scale_factor=0.18215):
     """
     Evaluate full volume generation using sliding window approach
     
@@ -494,6 +511,7 @@ def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume
         guidance_scale: CFG scale
         ema_wrapper: Optional EMA wrapper
         save_dir: Optional directory to save results
+        scale_factor: Latent scaling factor
     
     Returns:
         generated_volume: [D, H, W] generated CT volume (middle slices only)
@@ -518,6 +536,7 @@ def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume
         latent_shape = vae.encoder(dummy_input)[0].shape
     
     logger.info(f"Generating {num_slices} slices using sliding window approach...")
+    logger.info(f"Scale factor: {scale_factor}")
     
     from tqdm import tqdm
     
@@ -555,8 +574,13 @@ def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume
                 show_progress=False
             )
             
+            # ============================================================
+            # FIX: Decode 전 Rescaling 적용
+            # ============================================================
+            z_gen_rescaled = z_gen / scale_factor
+            
             # Decode
-            gen_volume = vae.decode(z_gen)
+            gen_volume = vae.decode(z_gen_rescaled)
             gen_volume = torch.clamp(gen_volume, -1, 1)
             
             # Extract middle slice

@@ -4,6 +4,9 @@
 Generates CT volumes from panoramic X-ray images using sliding window approach.
 Each 3-slice window is generated jointly, then middle slices are extracted.
 
+FIXES APPLIED:
+1. Scale factor 적용 - decode 전 rescaling
+
 Usage examples:
     # Generate single slice
     python inference_latent.py --checkpoint model.pth --pano_path pano.raw --slice_idx 60
@@ -168,7 +171,7 @@ def load_from_dataset_folder(folder_path, panorama_type='axial', slice_range=(0,
 def generate_single_window(vae, diffusion_model, diffusion_process, 
                           pano_window, slice_position, device,
                           guidance_scale=1.5, use_ddim=False, ddim_steps=50,
-                          use_self_conditioning=True):
+                          use_self_conditioning=True, scale_factor=0.18215):
     """
     Generate a single 3-slice window
     
@@ -183,6 +186,7 @@ def generate_single_window(vae, diffusion_model, diffusion_process,
         use_ddim: Use DDIM sampling
         ddim_steps: Number of DDIM steps
         use_self_conditioning: Enable self-conditioning
+        scale_factor: Latent scaling factor (default: 0.18215, Stable Diffusion standard)
     
     Returns:
         generated: [1, D=3, H, W] generated volume
@@ -210,11 +214,10 @@ def generate_single_window(vae, diffusion_model, diffusion_process,
                 pano_tensor,
                 device,
                 slice_pos=slice_pos,
-                num_steps=ddim_steps,
+                ddim_steps=ddim_steps,
                 guidance_scale=guidance_scale,
                 eta=0.0,  # Deterministic
-                use_self_conditioning=use_self_conditioning,
-                show_progress=False
+                use_self_conditioning=use_self_conditioning
             )
         else:
             # Full DDPM sampling
@@ -229,8 +232,14 @@ def generate_single_window(vae, diffusion_model, diffusion_process,
                 show_progress=False
             )
         
+        # ============================================================
+        # FIX: Decode 전 Rescaling 적용
+        # Diffusion이 생성한 scaled latent를 원래 스케일로 복원
+        # ============================================================
+        z_gen_rescaled = z_gen / scale_factor
+        
         # Decode
-        generated = vae.decode(z_gen)
+        generated = vae.decode(z_gen_rescaled)
         generated = torch.clamp(generated, -1, 1)
     
     return generated
@@ -239,7 +248,8 @@ def generate_single_window(vae, diffusion_model, diffusion_process,
 def generate_full_volume(vae, diffusion_model, diffusion_process,
                         pano_volume, device, slice_range=(0, 120),
                         guidance_scale=1.5, use_ddim=False, ddim_steps=50,
-                        use_self_conditioning=True, overlap_blend=True):
+                        use_self_conditioning=True, overlap_blend=True,
+                        scale_factor=0.18215):
     """
     Generate full CT volume using sliding window approach
     
@@ -255,6 +265,7 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
         ddim_steps: DDIM steps
         use_self_conditioning: Enable self-conditioning
         overlap_blend: Blend overlapping regions
+        scale_factor: Latent scaling factor
     
     Returns:
         generated_volume: [D, H, W] generated CT volume
@@ -274,6 +285,7 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
     logger.info(f"Generating {num_slices} slices using sliding window...")
     logger.info(f"Guidance scale: {guidance_scale}")
     logger.info(f"Sampling: {'DDIM' if use_ddim else 'DDPM'} ({ddim_steps if use_ddim else 1000} steps)")
+    logger.info(f"Scale factor: {scale_factor}")
     
     for center_idx in tqdm(range(num_slices), desc="Generating"):
         # Get 3-slice panorama window with boundary handling
@@ -296,7 +308,8 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
             guidance_scale=guidance_scale,
             use_ddim=use_ddim,
             ddim_steps=ddim_steps,
-            use_self_conditioning=use_self_conditioning
+            use_self_conditioning=use_self_conditioning,
+            scale_factor=scale_factor  # Pass scale_factor
         )
         
         # Extract slices [1, 1, 3, H, W] -> [3, H, W]
@@ -484,6 +497,12 @@ def main(args):
     cond_channels = config.get('model', {}).get('cond_channels', args.cond_channels)
     panorama_type = config.get('data', {}).get('panorama_type', args.panorama_type)
     
+    # ============================================================
+    # FIX: Scale factor 로드 (checkpoint config에서 가져오거나 기본값 사용)
+    # ============================================================
+    scale_factor = config.get('model', {}).get('scale_factor', args.scale_factor)
+    logger.info(f"Using scale factor: {scale_factor}")
+    
     # Diffusion config
     num_timesteps = config.get('diffusion', {}).get('num_timesteps', args.num_timesteps)
     beta_start = config.get('diffusion', {}).get('beta_start', 0.0001)
@@ -499,6 +518,7 @@ def main(args):
     logger.info(f"Diffusion channels: {diffusion_channels}")
     logger.info(f"Prediction type: {prediction_type}")
     logger.info(f"Self-conditioning: {use_self_conditioning}")
+    logger.info(f"Scale factor: {scale_factor}")
     logger.info("="*60 + "\n")
     
     # Create models
@@ -617,7 +637,8 @@ def main(args):
             guidance_scale=args.guidance_scale,
             use_ddim=args.use_ddim,
             ddim_steps=args.ddim_steps,
-            use_self_conditioning=use_self_conditioning
+            use_self_conditioning=use_self_conditioning,
+            scale_factor=scale_factor  # Pass scale_factor
         )
         
         # Extract middle slice
@@ -661,7 +682,8 @@ def main(args):
             use_ddim=args.use_ddim,
             ddim_steps=args.ddim_steps,
             use_self_conditioning=use_self_conditioning,
-            overlap_blend=args.overlap_blend
+            overlap_blend=args.overlap_blend,
+            scale_factor=scale_factor  # Pass scale_factor
         )
         
         # Save volume
@@ -744,6 +766,12 @@ if __name__ == '__main__':
                        help='Use EMA weights if available')
     parser.add_argument('--use_self_conditioning', action='store_true', default=True,
                        help='Enable self-conditioning')
+    
+    # ============================================================
+    # FIX: Scale factor 인자 추가
+    # ============================================================
+    parser.add_argument('--scale_factor', type=float, default=0.18215,
+                       help='Latent scaling factor (default: 0.18215, Stable Diffusion standard)')
     
     # Model config (overrides checkpoint config)
     parser.add_argument('--z_channels', type=int, default=8)

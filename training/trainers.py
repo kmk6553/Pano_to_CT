@@ -6,6 +6,7 @@ FIXES APPLIED:
 1. Latent Scaling - scale_factor 적용 (기본값 0.18215, Stable Diffusion 표준)
 2. VAE Sampling - mean 대신 sample(mean, logvar) 사용
 3. Decode 전 Rescaling 적용
+4. GPU Augmentation 조건문 수정 - dataset.augment 플래그 제거 (v5.1)
 """
 
 import torch
@@ -169,9 +170,13 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
         # Permute if needed: [B, 1, 3, H, W] is correct for 3D VAE
         # where 3 is the depth dimension
         
-        if gpu_augmenter is not None and dataloader.dataset.augment:
+        # ============================================================
+        # FIX: GPU Augmentation 조건문 수정
+        # dataset.augment 플래그와 무관하게 gpu_augmenter가 있으면 실행
+        # (main.py에서 GPU aug 사용 시 CPU aug를 끄므로 dataset.augment=False가 됨)
+        # ============================================================
+        if gpu_augmenter is not None:
             # GPU augmentation for 3D data
-            # Note: may need to adapt gpu_augmenter for 3D
             ct_volume_2d = ct_volume.squeeze(1)  # [B, 3, H, W] treat depth as channels
             ct_volume_2d, _ = gpu_augmenter(ct_volume_2d, None, epoch=epoch)
             ct_volume = ct_volume_2d.unsqueeze(1)  # [B, 1, 3, H, W]
@@ -339,6 +344,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     1. Scale factor 적용 (기본값 0.18215)
     2. VAE sampling 사용 (mean 대신 sample(mean, logvar))
     3. Decode 전 rescaling 적용
+    4. GPU Augmentation 조건문 수정 (v5.1)
     """
     diffusion_model.train()
     vae.eval()
@@ -402,7 +408,11 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         if ct_volume.dim() == 4:
             ct_volume = ct_volume.unsqueeze(1)
         
-        if gpu_augmenter is not None and dataloader.dataset.augment:
+        # ============================================================
+        # FIX: GPU Augmentation 조건문 수정
+        # dataset.augment 플래그와 무관하게 gpu_augmenter가 있으면 실행
+        # ============================================================
+        if gpu_augmenter is not None:
             # Augment (treating depth as channels for 2D augmenter)
             ct_volume_2d = ct_volume.squeeze(1)  # [B, 3, H, W]
             ct_volume_2d, condition = gpu_augmenter(ct_volume_2d, condition, epoch=epoch)

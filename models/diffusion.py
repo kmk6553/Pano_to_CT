@@ -244,9 +244,7 @@ class ConditionEncoder3D(nn.Module):
         """
         # Handle different input formats
         if cond.dim() == 5:
-            # [B, 1, 3, H, W] -> [B, 3, H, W]
-            cond = cond.squeeze(1).permute(0, 2, 1, 3)  # This won't work correctly
-            # Actually: [B, 1, D=3, H, W] -> need to process each depth slice
+            # Input: [B, 1, D=3, H, W] -> Flatten depth to batch for 2D processing
             b, c, d, h, w = cond.shape
             # Reshape to process each slice: [B*D, 1, H, W]
             cond_flat = cond.permute(0, 2, 1, 3, 4).reshape(b * d, c, h, w)

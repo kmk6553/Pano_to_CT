@@ -1,6 +1,9 @@
 """
 3D Diffusion model components with Multi-scale Spatial Conditioning and Position Embedding
 Processes 3D latent volumes [B, C, D=3, h, w]
+
+UPDATES:
+- Added AttentionBlock3D to middle blocks for improved Z-axis consistency
 """
 
 import torch
@@ -8,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from .vae import ResidualBlock3D
+from .vae import ResidualBlock3D, AttentionBlock3D
 
 
 class SinusoidalPosEmb(nn.Module):
@@ -285,6 +288,8 @@ class ConditionalUNet3D(nn.Module):
     
     Processes 3D latent volumes [B, C, D=3, h, w]
     Uses multi-scale spatial conditioning and position embedding
+    
+    UPDATED: Added AttentionBlock3D to middle blocks for improved Z-axis consistency
     """
     def __init__(self, in_channels=8, out_channels=8, channels=128, 
                  channel_multipliers=(1, 2, 4, 8), cond_channels=512, 
@@ -361,10 +366,14 @@ class ConditionalUNet3D(nn.Module):
             
             self.down_blocks.append(nn.ModuleList(layers))
         
-        # Middle blocks
+        # ============================================================
+        # UPDATED: Middle blocks with Self-Attention for Z-axis consistency
+        # Added AttentionBlock3D between ConditionalResBlock3D layers
+        # ============================================================
         spatial_ch = cond_channels
         self.mid_blocks = nn.ModuleList([
             ConditionalResBlock3D(ch, ch, time_dim, cond_channels, spatial_ch),
+            AttentionBlock3D(ch),  # <--- Self-Attention 추가
             ConditionalResBlock3D(ch, ch, time_dim, cond_channels, spatial_ch)
         ])
         
@@ -461,10 +470,19 @@ class ConditionalUNet3D(nn.Module):
                 elif isinstance(layer, Downsample3D):
                     h = layer(h)
         
-        # Middle with spatial conditioning
+        # ============================================================
+        # UPDATED: Middle with spatial conditioning and Self-Attention
+        # Handle both ConditionalResBlock3D and AttentionBlock3D
+        # ============================================================
         spatial_cond = self.spatial_injectors[-1](spatial_features[-1], h.shape[2:])
         for layer in self.mid_blocks:
-            h = layer(h, t_emb, cond_global, spatial_cond)
+            if isinstance(layer, ConditionalResBlock3D):
+                h = layer(h, t_emb, cond_global, spatial_cond)
+            elif isinstance(layer, AttentionBlock3D):
+                # AttentionBlock3D only takes x as input
+                h = layer(h)
+            else:
+                h = layer(h)
         
         # Upsampling with skip connections and spatial conditioning
         for i, layers in enumerate(self.up_blocks):

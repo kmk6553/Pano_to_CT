@@ -664,7 +664,9 @@ def main(args):
                 accumulation_steps=accumulation_steps,
                 gpu_augmenter=gpu_augmenter,
                 gdl_loss_fn=gdl_loss_fn if vae_gdl_weight > 0 else None,  # [추가]
-                gdl_weight=vae_gdl_weight  # [추가]
+                gdl_weight=vae_gdl_weight,  # [추가]
+                use_amp=use_amp_vae,           # 추가
+                autocast_dtype=autocast_dtype   # 추가
             )
             
             if np.isnan(vae_loss) or np.isinf(vae_loss):

@@ -6,12 +6,16 @@ Each 3-slice window is generated jointly, then middle slices are extracted.
 
 FIXES APPLIED:
 1. Scale factor 적용 - decode 전 rescaling
+2. [v5.7] 정규화 로직 버그 수정 - dataset.py와 일관성 유지
+   - normalize_input 플래그 추가
+   - [0, 1] 데이터가 변환 없이 통과되는 버그 수정
+3. [v5.7] 데이터 범위 검증 및 경고 메시지 추가
 
 Usage examples:
-    # Generate single slice
-    python inference_latent.py --checkpoint model.pth --pano_path pano.raw --slice_idx 60
+    # Generate single slice (data is in [0, 1] range)
+    python inference_latent.py --checkpoint model.pth --pano_path pano.raw --slice_idx 60 --normalize_input
     
-    # Generate full volume
+    # Generate full volume (data is already in [-1, 1] range)
     python inference_latent.py --checkpoint model.pth --pano_dir folder/ --output_dir results/
     
     # Generate with DDIM (faster)
@@ -47,14 +51,113 @@ def load_checkpoint(checkpoint_path, device):
     return checkpoint
 
 
-def load_panorama_volume(pano_path, slice_range=(0, 120), shape=(200, 200)):
+def validate_data_range(data, name, expected_range=(-1, 1), tolerance=0.1):
+    """
+    Validate data range and log warnings if unexpected
+    
+    Args:
+        data: numpy array
+        name: name for logging
+        expected_range: (min, max) expected range
+        tolerance: tolerance for range check
+    
+    Returns:
+        True if data is in expected range, False otherwise
+    """
+    data_min, data_max = data.min(), data.max()
+    exp_min, exp_max = expected_range
+    
+    in_range = (data_min >= exp_min - tolerance) and (data_max <= exp_max + tolerance)
+    
+    if not in_range:
+        logger.warning(f"{name} data range [{data_min:.4f}, {data_max:.4f}] "
+                      f"differs from expected [{exp_min}, {exp_max}]")
+    
+    return in_range
+
+
+def normalize_to_model_range(data, input_range='auto', target_range=(-1, 1)):
+    """
+    Normalize data to target range for model input
+    
+    [v5.7 FIX] dataset.py와 동일한 정규화 정책 적용
+    
+    Args:
+        data: numpy array
+        input_range: 'auto', '0_1', '-1_1', or tuple (min, max)
+        target_range: output range (default: (-1, 1))
+    
+    Returns:
+        Normalized data in target_range
+    """
+    data_min, data_max = data.min(), data.max()
+    
+    # Auto-detect input range
+    if input_range == 'auto':
+        if data_min >= -0.1 and data_max <= 1.1:
+            if data_min >= -0.1 and data_min <= 0.1 and data_max >= 0.9:
+                # Likely [0, 1] range
+                input_range = '0_1'
+                logger.info(f"Auto-detected input range: [0, 1] (actual: [{data_min:.4f}, {data_max:.4f}])")
+            elif data_min >= -1.1 and data_min <= -0.5:
+                # Likely [-1, 1] range
+                input_range = '-1_1'
+                logger.info(f"Auto-detected input range: [-1, 1] (actual: [{data_min:.4f}, {data_max:.4f}])")
+            else:
+                # Ambiguous, assume [0, 1]
+                input_range = '0_1'
+                logger.warning(f"Ambiguous input range [{data_min:.4f}, {data_max:.4f}], assuming [0, 1]")
+        else:
+            # Values outside [0, 1] or [-1, 1], need full normalization
+            input_range = 'full'
+            logger.info(f"Input range [{data_min:.4f}, {data_max:.4f}] requires full normalization")
+    
+    # Apply normalization based on detected/specified input range
+    if input_range == '0_1':
+        # [0, 1] -> [-1, 1]: x' = x * 2 - 1
+        normalized = data * 2.0 - 1.0
+        logger.info("Applied transformation: [0, 1] -> [-1, 1]")
+    elif input_range == '-1_1':
+        # Already in [-1, 1], no transformation needed
+        normalized = data
+        logger.info("No transformation needed (already [-1, 1])")
+    elif input_range == 'full' or isinstance(input_range, tuple):
+        # Full min-max normalization
+        if isinstance(input_range, tuple):
+            src_min, src_max = input_range
+        else:
+            src_min, src_max = data_min, data_max
+        
+        if src_max - src_min < 1e-8:
+            logger.warning("Data has near-zero range, returning zeros")
+            return np.zeros_like(data)
+        
+        # Normalize to [0, 1] first, then to target range
+        normalized = (data - src_min) / (src_max - src_min)
+        normalized = normalized * (target_range[1] - target_range[0]) + target_range[0]
+        logger.info(f"Applied full normalization: [{src_min:.4f}, {src_max:.4f}] -> {target_range}")
+    else:
+        raise ValueError(f"Unknown input_range: {input_range}")
+    
+    # Final clip to ensure we're in target range
+    normalized = np.clip(normalized, target_range[0], target_range[1])
+    
+    return normalized
+
+
+def load_panorama_volume(pano_path, slice_range=(0, 120), shape=(200, 200), 
+                        normalize_input=True, input_range='auto'):
     """
     Load panorama volume from raw file or directory
+    
+    [v5.7 FIX] 정규화 로직 개선
     
     Args:
         pano_path: Path to .raw file or directory containing slice files
         slice_range: (start, end) slice indices
         shape: (H, W) shape of each slice
+        normalize_input: If True, apply normalization to [-1, 1]
+        input_range: 'auto', '0_1', '-1_1', or tuple for manual range
     
     Returns:
         pano_volume: [D, H, W] numpy array normalized to [-1, 1]
@@ -105,65 +208,122 @@ def load_panorama_volume(pano_path, slice_range=(0, 120), shape=(200, 200)):
     else:
         raise FileNotFoundError(f"Panorama path not found: {pano_path}")
     
-    # Normalize to [-1, 1] if not already
-    if pano_volume.max() > 1.0 or pano_volume.min() < -1.0:
-        pano_volume = (pano_volume - pano_volume.min()) / (pano_volume.max() - pano_volume.min() + 1e-8)
-        pano_volume = pano_volume * 2 - 1
+    # Log raw data range before normalization
+    logger.info(f"Raw panorama data range: [{pano_volume.min():.4f}, {pano_volume.max():.4f}]")
+    
+    # ============================================================
+    # [v5.7 FIX] 정규화 로직 개선
+    # 기존 버그: [0, 1] 데이터가 변환 없이 통과됨
+    # 수정: normalize_input 플래그와 input_range로 명시적 제어
+    # ============================================================
+    if normalize_input:
+        pano_volume = normalize_to_model_range(pano_volume, input_range=input_range)
+    else:
+        logger.info("Normalization disabled, using data as-is")
+        # Still validate the range
+        if not validate_data_range(pano_volume, "Panorama"):
+            logger.warning("Data is not in [-1, 1] range but normalization is disabled!")
+            logger.warning("This may cause poor generation quality.")
     
     logger.info(f"Loaded panorama volume: {pano_volume.shape}")
-    logger.info(f"Value range: [{pano_volume.min():.3f}, {pano_volume.max():.3f}]")
+    logger.info(f"Final value range: [{pano_volume.min():.4f}, {pano_volume.max():.4f}]")
     
     return pano_volume
 
 
-def load_from_dataset_folder(folder_path, panorama_type='axial', slice_range=(0, 120)):
+def load_from_dataset_folder(folder_path, panorama_type='axial', slice_range=(0, 120),
+                            normalize_input=True, input_range='auto'):
     """
     Load panorama from standard dataset folder structure
     
+    [v5.7 FIX] 정규화 로직 개선
+    
     Expected structure:
         folder_path/
-            axial_pano.raw or coronal_pano.raw or mip_pano.raw
-            ct_volume.raw (optional, for comparison)
+            Pano/Pano_Normalized_float32_200x200x120.raw
+            CT/CT_Normalized_float32_200x200x120.raw (optional, for comparison)
+    
+    Args:
+        folder_path: Path to dataset folder
+        panorama_type: Type of panorama extraction
+        slice_range: (start, end) slice indices
+        normalize_input: If True, apply normalization to [-1, 1]
+        input_range: 'auto', '0_1', '-1_1', or tuple for manual range
+    
+    Returns:
+        pano_volume: [D, H, W] panorama volume
+        ct_volume: [D, H, W] CT volume or None
     """
-    pano_names = {
-        'axial': 'axial_pano.raw',
-        'coronal': 'coronal_pano.raw', 
-        'mip': 'mip_pano.raw',
-        'curved': 'curved_pano.raw'
-    }
+    # Try different path patterns
+    pano_paths = [
+        os.path.join(folder_path, 'Pano', 'Pano_Normalized_float32_200x200x120.raw'),
+        os.path.join(folder_path, 'pano', 'pano_normalized.raw'),
+        os.path.join(folder_path, 'panorama', f'{panorama_type}_pano.raw'),
+        os.path.join(folder_path, f'{panorama_type}_pano.raw'),
+    ]
     
-    pano_file = pano_names.get(panorama_type, 'axial_pano.raw')
-    pano_path = os.path.join(folder_path, pano_file)
+    pano_path = None
+    for p in pano_paths:
+        if os.path.exists(p):
+            pano_path = p
+            break
     
-    if not os.path.exists(pano_path):
-        # Try alternative path
-        pano_path = os.path.join(folder_path, 'panorama', pano_file)
+    if pano_path is None:
+        raise FileNotFoundError(f"Panorama file not found in: {folder_path}")
     
-    if not os.path.exists(pano_path):
-        raise FileNotFoundError(f"Panorama file not found: {pano_path}")
+    logger.info(f"Loading panorama from: {pano_path}")
     
     # Load panorama
-    pano_volume = np.fromfile(pano_path, dtype=np.float32)
+    pano_data = np.fromfile(pano_path, dtype=np.float32)
     
     # Infer shape (assuming 200x200 slices)
     H, W = 200, 200
-    num_total_slices = pano_volume.size // (H * W)
-    pano_volume = pano_volume.reshape(num_total_slices, H, W)
+    num_total_slices = pano_data.size // (H * W)
+    pano_volume = pano_data.reshape(num_total_slices, H, W)
     
     start_idx, end_idx = slice_range
     pano_volume = pano_volume[start_idx:end_idx]
     
-    # Normalize
-    pano_volume = np.clip(pano_volume, -1, 1)
+    # Log raw data range
+    logger.info(f"Raw panorama data range: [{pano_volume.min():.4f}, {pano_volume.max():.4f}]")
     
-    # Also try to load CT for comparison
+    # ============================================================
+    # [v5.7 FIX] 정규화 로직 개선
+    # 기존 버그: np.clip만 적용하여 [0, 1] 데이터가 그대로 유지됨
+    # 수정: normalize_input 플래그와 input_range로 명시적 제어
+    # ============================================================
+    if normalize_input:
+        pano_volume = normalize_to_model_range(pano_volume, input_range=input_range)
+    else:
+        logger.info("Normalization disabled, using data as-is")
+        if not validate_data_range(pano_volume, "Panorama"):
+            logger.warning("Data is not in [-1, 1] range but normalization is disabled!")
+    
+    logger.info(f"Final panorama range: [{pano_volume.min():.4f}, {pano_volume.max():.4f}]")
+    
+    # Try to load CT for comparison
     ct_volume = None
-    ct_path = os.path.join(folder_path, 'ct_volume.raw')
-    if os.path.exists(ct_path):
-        ct_data = np.fromfile(ct_path, dtype=np.float32)
-        ct_total = ct_data.size // (H * W)
-        ct_volume = ct_data.reshape(ct_total, H, W)[start_idx:end_idx]
-        ct_volume = np.clip(ct_volume, -1, 1)
+    ct_paths = [
+        os.path.join(folder_path, 'CT', 'CT_Normalized_float32_200x200x120.raw'),
+        os.path.join(folder_path, 'ct', 'ct_normalized.raw'),
+        os.path.join(folder_path, 'ct_volume.raw'),
+    ]
+    
+    for ct_path in ct_paths:
+        if os.path.exists(ct_path):
+            logger.info(f"Loading CT from: {ct_path}")
+            ct_data = np.fromfile(ct_path, dtype=np.float32)
+            ct_total = ct_data.size // (H * W)
+            ct_volume = ct_data.reshape(ct_total, H, W)[start_idx:end_idx]
+            
+            logger.info(f"Raw CT data range: [{ct_volume.min():.4f}, {ct_volume.max():.4f}]")
+            
+            # Apply same normalization to CT
+            if normalize_input:
+                ct_volume = normalize_to_model_range(ct_volume, input_range=input_range)
+            
+            logger.info(f"Final CT range: [{ct_volume.min():.4f}, {ct_volume.max():.4f}]")
+            break
     
     return pano_volume, ct_volume
 
@@ -179,7 +339,7 @@ def generate_single_window(vae, diffusion_model, diffusion_process,
         vae: 3D VAE model
         diffusion_model: 3D Diffusion UNet
         diffusion_process: Diffusion process
-        pano_window: [3, H, W] panorama condition
+        pano_window: [3, H, W] panorama condition (must be in [-1, 1])
         slice_position: Normalized position [0, 1]
         device: Device
         guidance_scale: CFG scale
@@ -193,6 +353,11 @@ def generate_single_window(vae, diffusion_model, diffusion_process,
     """
     vae.eval()
     diffusion_model.eval()
+    
+    # Validate input range
+    if pano_window.min() < -1.1 or pano_window.max() > 1.1:
+        logger.warning(f"pano_window range [{pano_window.min():.4f}, {pano_window.max():.4f}] "
+                      f"is outside expected [-1, 1]. This may cause poor results.")
     
     # Prepare inputs
     pano_tensor = torch.from_numpy(pano_window).unsqueeze(0).float().to(device)  # [1, 3, H, W]
@@ -257,7 +422,7 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
         vae: 3D VAE model
         diffusion_model: 3D Diffusion UNet
         diffusion_process: Diffusion process
-        pano_volume: [D, H, W] panorama volume
+        pano_volume: [D, H, W] panorama volume (must be in [-1, 1])
         device: Device
         slice_range: (start, end) indices
         guidance_scale: CFG scale
@@ -270,6 +435,15 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
     Returns:
         generated_volume: [D, H, W] generated CT volume
     """
+    # Validate input range
+    pano_min, pano_max = pano_volume.min(), pano_volume.max()
+    if pano_min < -1.1 or pano_max > 1.1:
+        logger.warning(f"pano_volume range [{pano_min:.4f}, {pano_max:.4f}] "
+                      f"is outside expected [-1, 1]. This may cause poor results.")
+    elif pano_min > -0.5 and pano_max < 0.5:
+        logger.warning(f"pano_volume has narrow range [{pano_min:.4f}, {pano_max:.4f}]. "
+                      f"Check if normalization was applied correctly.")
+    
     start_idx, end_idx = slice_range
     num_slices = end_idx - start_idx
     H, W = pano_volume.shape[1], pano_volume.shape[2]
@@ -283,6 +457,7 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
         accumulated = np.zeros((num_slices, H, W))
     
     logger.info(f"Generating {num_slices} slices using sliding window...")
+    logger.info(f"Input panorama range: [{pano_min:.4f}, {pano_max:.4f}]")
     logger.info(f"Guidance scale: {guidance_scale}")
     logger.info(f"Sampling: {'DDIM' if use_ddim else 'DDPM'} ({ddim_steps if use_ddim else 1000} steps)")
     logger.info(f"Scale factor: {scale_factor}")
@@ -340,7 +515,7 @@ def generate_full_volume(vae, diffusion_model, diffusion_process,
     generated_volume = np.clip(generated_volume, -1, 1)
     
     logger.info(f"Generated volume shape: {generated_volume.shape}")
-    logger.info(f"Value range: [{generated_volume.min():.3f}, {generated_volume.max():.3f}]")
+    logger.info(f"Value range: [{generated_volume.min():.4f}, {generated_volume.max():.4f}]")
     
     return generated_volume
 
@@ -498,10 +673,24 @@ def main(args):
     panorama_type = config.get('data', {}).get('panorama_type', args.panorama_type)
     
     # ============================================================
-    # FIX: Scale factor 로드 (checkpoint config에서 가져오거나 기본값 사용)
+    # Scale factor 로드 (checkpoint config에서 가져오거나 기본값 사용)
     # ============================================================
     scale_factor = config.get('model', {}).get('scale_factor', args.scale_factor)
     logger.info(f"Using scale factor: {scale_factor}")
+    
+    # ============================================================
+    # [v5.7] Normalization 설정 확인
+    # ============================================================
+    # 학습 시 사용된 normalize_volumes 설정 확인
+    train_normalize = config.get('data', {}).get('normalize_volumes', None)
+    if train_normalize is not None:
+        logger.info(f"Training used normalize_volumes={train_normalize}")
+        if train_normalize and not args.normalize_input:
+            logger.warning("Training used normalize_volumes=True but --normalize_input not specified!")
+            logger.warning("Consider adding --normalize_input if your data is in [0, 1] range.")
+        elif not train_normalize and args.normalize_input:
+            logger.warning("Training used normalize_volumes=False but --normalize_input specified!")
+            logger.warning("This may cause a mismatch. Check your data range.")
     
     # Diffusion config
     num_timesteps = config.get('diffusion', {}).get('num_timesteps', args.num_timesteps)
@@ -519,6 +708,11 @@ def main(args):
     logger.info(f"Prediction type: {prediction_type}")
     logger.info(f"Self-conditioning: {use_self_conditioning}")
     logger.info(f"Scale factor: {scale_factor}")
+    logger.info("="*60)
+    logger.info("Normalization Settings")
+    logger.info("="*60)
+    logger.info(f"normalize_input: {args.normalize_input}")
+    logger.info(f"input_range: {args.input_range}")
     logger.info("="*60 + "\n")
     
     # Create models
@@ -584,7 +778,9 @@ def main(args):
         pano_volume, ct_volume = load_from_dataset_folder(
             args.data_folder, 
             panorama_type=panorama_type,
-            slice_range=slice_range
+            slice_range=slice_range,
+            normalize_input=args.normalize_input,
+            input_range=args.input_range
         )
     elif args.pano_path:
         # Load from panorama file
@@ -592,17 +788,25 @@ def main(args):
         pano_volume = load_panorama_volume(
             args.pano_path,
             slice_range=slice_range,
-            shape=(args.image_size, args.image_size)
+            shape=(args.image_size, args.image_size),
+            normalize_input=args.normalize_input,
+            input_range=args.input_range
         )
         ct_volume = None
         
         # Optionally load CT for comparison
         if args.ct_path:
+            logger.info(f"Loading CT from: {args.ct_path}")
             ct_data = np.fromfile(args.ct_path, dtype=np.float32)
             num_total = ct_data.size // (args.image_size * args.image_size)
             ct_volume = ct_data.reshape(num_total, args.image_size, args.image_size)
             ct_volume = ct_volume[slice_range[0]:slice_range[1]]
-            ct_volume = np.clip(ct_volume, -1, 1)
+            
+            # Apply same normalization to CT
+            if args.normalize_input:
+                ct_volume = normalize_to_model_range(ct_volume, input_range=args.input_range)
+            
+            logger.info(f"CT volume range: [{ct_volume.min():.4f}, {ct_volume.max():.4f}]")
     else:
         raise ValueError("Must specify either --data_folder or --pano_path")
     
@@ -767,11 +971,21 @@ if __name__ == '__main__':
     parser.add_argument('--use_self_conditioning', action='store_true', default=True,
                        help='Enable self-conditioning')
     
-    # ============================================================
-    # FIX: Scale factor 인자 추가
-    # ============================================================
+    # Scale factor
     parser.add_argument('--scale_factor', type=float, default=0.18215,
                        help='Latent scaling factor (default: 0.18215, Stable Diffusion standard)')
+    
+    # ============================================================
+    # [v5.7] Normalization options - 학습 시 설정과 일치시켜야 함
+    # ============================================================
+    parser.add_argument('--normalize_input', action='store_true', default=False,
+                       help='Apply [0,1] -> [-1,1] normalization to input data. '
+                            'Use this if your data is in [0,1] range. '
+                            'Should match --normalize_volumes setting used during training.')
+    parser.add_argument('--input_range', type=str, default='auto',
+                       choices=['auto', '0_1', '-1_1'],
+                       help='Input data range: auto (detect), 0_1, or -1_1. '
+                            'Use with --normalize_input for explicit control.')
     
     # Model config (overrides checkpoint config)
     parser.add_argument('--z_channels', type=int, default=8)

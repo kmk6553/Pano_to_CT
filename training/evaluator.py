@@ -4,6 +4,8 @@ Evaluates 3-slice windows: [B, 1, D=3, H, W]
 
 FIXES APPLIED:
 1. Scale factor 적용 - diffusion 생성물 decode 시 rescaling
+2. [v5.7] scale_factor를 필수 파라미터로 변경하여 누락 방지
+3. [v5.7] VAE 평가 시에도 scale_factor 로깅
 """
 
 import torch
@@ -252,9 +254,10 @@ def visualize_vae_3d(recon_volume, target_volume, save_path, metrics=None):
 
 
 def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader, 
-                          device, epoch, save_dir, phase_name, metrics_tracker, ema_wrapper=None,
-                          guidance_scale=1.5, fixed_slice_indices=[20, 40, 60, 80, 100],
-                          scale_factor=0.18215):
+                          device, epoch, save_dir, phase_name, metrics_tracker, 
+                          ema_wrapper=None, guidance_scale=1.5, 
+                          fixed_slice_indices=[20, 40, 60, 80, 100],
+                          scale_factor=None):
     """
     Comprehensive evaluation and visualization for 3D Slab models
     
@@ -271,8 +274,22 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
         ema_wrapper: Optional EMA wrapper for diffusion model
         guidance_scale: CFG scale for diffusion
         fixed_slice_indices: Specific indices to evaluate
-        scale_factor: Latent scaling factor (default: 0.18215)
+        scale_factor: Latent scaling factor (REQUIRED for diffusion, optional for VAE)
+    
+    FIXES (v5.7):
+        - scale_factor가 None이면 기본값 0.18215 사용하되 경고 출력
+        - Diffusion 평가 시 scale_factor 필수
     """
+    # ============================================================
+    # [v5.7] scale_factor 검증
+    # ============================================================
+    if scale_factor is None:
+        scale_factor = 0.18215
+        if phase_name == 'diffusion':
+            logger.warning(f"scale_factor not provided for diffusion evaluation! "
+                          f"Using default value: {scale_factor}")
+            logger.warning("This may cause incorrect decoding if auto_scale_factor was used.")
+    
     vae.eval()
     
     if ema_wrapper is not None and diffusion_model is not None:
@@ -494,7 +511,7 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
 
 def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume, 
                            device, slice_range=(0, 120), guidance_scale=1.5,
-                           ema_wrapper=None, save_dir=None, scale_factor=0.18215):
+                           ema_wrapper=None, save_dir=None, scale_factor=None):
     """
     Evaluate full volume generation using sliding window approach
     
@@ -511,11 +528,22 @@ def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume
         guidance_scale: CFG scale
         ema_wrapper: Optional EMA wrapper
         save_dir: Optional directory to save results
-        scale_factor: Latent scaling factor
+        scale_factor: Latent scaling factor (REQUIRED)
     
     Returns:
         generated_volume: [D, H, W] generated CT volume (middle slices only)
+    
+    FIXES (v5.7):
+        - scale_factor가 None이면 기본값 사용하되 경고 출력
     """
+    # ============================================================
+    # [v5.7] scale_factor 검증
+    # ============================================================
+    if scale_factor is None:
+        scale_factor = 0.18215
+        logger.warning(f"scale_factor not provided! Using default value: {scale_factor}")
+        logger.warning("This may cause incorrect decoding if auto_scale_factor was used.")
+    
     vae.eval()
     
     if ema_wrapper is not None:

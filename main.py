@@ -8,8 +8,10 @@ Generates 3 slices simultaneously for improved z-axis consistency
 FIXES APPLIED:
 1. GPU Augmentation 사용 시 CPU Augmentation 비활성화
 2. Scale factor 설정 추가 (config['model']['scale_factor'])
-3. [신규] VAE 학습에 gdl_loss_fn 전달
-4. [신규] normalize_volumes 옵션 경고 메시지 추가
+3. VAE 학습에 gdl_loss_fn 전달
+4. normalize_volumes 옵션 경고 메시지 추가
+5. [v5.7] evaluate_and_visualize 호출 시 scale_factor 전달 (버그 수정)
+6. [v5.7] 정규화 정책 경고 메시지 개선
 """
 
 import torch
@@ -169,7 +171,7 @@ def main(args):
                 'beta_cycle_length': 10,
                 'free_bits': 0.1,
                 'lpips_weight': args.vae_lpips_weight,
-                'gdl_weight': args.vae_gdl_weight,  # [추가] VAE GDL weight
+                'gdl_weight': args.vae_gdl_weight,
                 'initial_lr': args.vae_lr,
                 'target_lr': max(args.vae_lr * 10, 0.0001),
                 'warmup_epochs': 5,
@@ -214,17 +216,23 @@ def main(args):
         }
     
     # ============================================================
-    # [수정] normalize_volumes 옵션 경고 메시지
+    # [v5.7] 정규화 정책 경고 메시지 개선
     # ============================================================
+    logger.info("\n" + "="*60)
+    logger.info("NORMALIZATION POLICY")
+    logger.info("="*60)
     if config['data']['normalize_volumes']:
-        logger.warning("="*60)
-        logger.warning("WARNING: --normalize_volumes is ENABLED")
-        logger.warning("="*60)
-        logger.warning("이 옵션은 더 이상 통계 기반 정규화(Instance Norm)를 수행하지 않습니다.")
-        logger.warning("대신 단순 [0,1] -> [-1,1] 스케일링만 적용됩니다.")
-        logger.warning("이는 환자 간 밀도 차이 정보를 보존하기 위함입니다.")
-        logger.warning("기존 동작을 원하시면 코드를 확인해 주세요.")
-        logger.warning("="*60 + "\n")
+        logger.info("normalize_volumes = True")
+        logger.info("  - Expected input data range: [0, 1]")
+        logger.info("  - Output range after transform: [-1, 1]")
+        logger.info("  - Transformation: x' = x * 2 - 1")
+    else:
+        logger.info("normalize_volumes = False")
+        logger.info("  - Expected input data range: [-1, 1]")
+        logger.info("  - No transformation applied (passthrough)")
+    logger.info("")
+    logger.info("Make sure your data matches the expected input range!")
+    logger.info("="*60 + "\n")
     
     # Set seed and device
     set_seed(config['seed'])
@@ -323,7 +331,7 @@ def main(args):
     logger.info(f"CFG dropout: {config['diffusion']['cfg_dropout_prob']}")
     logger.info(f"CFG guidance scale: {config['diffusion']['guidance_scale']}")
     logger.info(f"Mid-slice weight (Diffusion): {config['diffusion']['mid_slice_weight']}")
-    logger.info(f"VAE GDL weight: {config['vae'].get('gdl_weight', 0.0)}")  # [추가]
+    logger.info(f"VAE GDL weight: {config['vae'].get('gdl_weight', 0.0)}")
     logger.info("="*60 + "\n")
     
     # Setup AMP
@@ -640,22 +648,20 @@ def main(args):
         logger.info("=== Phase 1: Training 3D VAE ===")
         logger.info("="*60)
         logger.info(f"Processing 3-slice windows: [B, 1, D=3, H, W]")
-        logger.info(f"Slice weighting: EQUAL (1/3 for all slices)")  # [수정]
-        logger.info(f"GDL weight: {config['vae'].get('gdl_weight', 0.0)}")  # [추가]
+        logger.info(f"Slice weighting: EQUAL (1/3 for all slices)")
+        logger.info(f"GDL weight: {config['vae'].get('gdl_weight', 0.0)}")
         logger.info(f"LPIPS weight: {config['vae']['lpips_weight']}")
         logger.info(f"Total epochs: {config['training']['vae_epochs']}")
         logger.info(f"Batch size: {config['training']['batch_size']}")
         logger.info(f"Effective batch size: {config['training']['batch_size'] * accumulation_steps}")
         logger.info("="*60 + "\n")
         
-        # [추가] VAE용 GDL loss weight
         vae_gdl_weight = config['vae'].get('gdl_weight', 0.0)
         
         for epoch in range(start_epoch, config['training']['vae_epochs'] + 1):
             if hasattr(train_dataset, 'set_epoch'):
                 train_dataset.set_epoch(epoch)
             
-            # [수정] gdl_loss_fn과 gdl_weight 전달
             vae_loss, recon_loss, kl_loss = train_vae_optimized(
                 vae, train_loader, vae_optimizer, vae_scheduler, device, epoch, config, metrics_tracker,
                 lpips_loss_fn=lpips_loss_fn if config['vae']['lpips_weight'] > 0 else None,
@@ -663,10 +669,10 @@ def main(args):
                 scaler=vae_scaler,
                 accumulation_steps=accumulation_steps,
                 gpu_augmenter=gpu_augmenter,
-                gdl_loss_fn=gdl_loss_fn if vae_gdl_weight > 0 else None,  # [추가]
-                gdl_weight=vae_gdl_weight,  # [추가]
-                use_amp=use_amp_vae,           # 추가
-                autocast_dtype=autocast_dtype   # 추가
+                gdl_loss_fn=gdl_loss_fn if vae_gdl_weight > 0 else None,
+                gdl_weight=vae_gdl_weight,
+                use_amp=use_amp_vae,
+                autocast_dtype=autocast_dtype
             )
             
             if np.isnan(vae_loss) or np.isinf(vae_loss):
@@ -677,9 +683,13 @@ def main(args):
                 continue
             
             if epoch % config['logging']['eval_interval'] == 0:
+                # ============================================================
+                # [v5.7 FIX] scale_factor 전달 추가
+                # ============================================================
                 evaluate_and_visualize(vae, None, None, val_loader, 
                                      device, epoch, os.path.join(save_dir, 'samples'), 
-                                     'vae', metrics_tracker)
+                                     'vae', metrics_tracker,
+                                     scale_factor=config['model']['scale_factor'])
             
             if epoch % config['logging']['plot_interval'] == 0:
                 metrics_tracker.plot_interim_metrics(save_dir, 'vae', epoch)
@@ -776,11 +786,15 @@ def main(args):
             early_stop = True
         
         if epoch % config['logging']['eval_interval'] == 0:
+            # ============================================================
+            # [v5.7 FIX] scale_factor 전달 추가
+            # ============================================================
             evaluate_and_visualize(vae, diffusion_model, diffusion_process, 
                                  val_loader, device, epoch, 
                                  os.path.join(save_dir, 'samples'), 
                                  'diffusion', metrics_tracker, ema_wrapper=ema_wrapper,
-                                 guidance_scale=config['diffusion']['guidance_scale'])
+                                 guidance_scale=config['diffusion']['guidance_scale'],
+                                 scale_factor=config['model']['scale_factor'])
         
         if epoch % config['logging']['plot_interval'] == 0:
             metrics_tracker.plot_interim_metrics(save_dir, 'diffusion', epoch)
@@ -907,7 +921,7 @@ if __name__ == '__main__':
                        choices=['coronal', 'axial', 'mip', 'curved'],
                        help='Panorama extraction type')
     parser.add_argument('--normalize_volumes', action='store_true', default=False,
-                       help='Use per-volume normalization (DEPRECATED: now uses simple scaling)')
+                       help='Apply [0,1] -> [-1,1] normalization. Set if your data is in [0,1] range.')
     parser.add_argument('--max_data_folders', type=int, default=500,
                        help='Maximum number of data folders to use')
     parser.add_argument('--cache_volumes', action='store_true', default=False,
@@ -956,7 +970,7 @@ if __name__ == '__main__':
     # VAE specific
     parser.add_argument('--vae_lpips_weight', type=float, default=0.1)
     parser.add_argument('--vae_gdl_weight', type=float, default=0.1,
-                       help='GDL weight for VAE training (default: 0.1)')  # [추가]
+                       help='GDL weight for VAE training (default: 0.1)')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=2,

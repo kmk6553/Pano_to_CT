@@ -1,6 +1,9 @@
 """
 Dataset and data loading utilities for 3D Slab-based generation
 Loads 3-slice CT windows: [B, 1, D=3, H, W]
+
+FIXES APPLIED:
+1. 이중 정규화 방지 - 통계 기반 정규화 제거, 단순 [0,1] -> [-1,1] 스케일링만 수행
 """
 
 import torch
@@ -54,7 +57,7 @@ class OptimizedDentalSliceDataset(Dataset):
         self.slices_per_volume = slice_range[1] - slice_range[0]
         self.total_slices = len(folders) * self.slices_per_volume
         
-        # Cache for volume statistics (for normalization)
+        # Cache for volume statistics (for normalization) - DEPRECATED but kept for compatibility
         self.volume_stats = {}
         
         # Windows multiprocessing compatibility
@@ -62,6 +65,11 @@ class OptimizedDentalSliceDataset(Dataset):
             self.persistent_cache = False
         else:
             self.persistent_cache = True
+        
+        # Log normalization mode
+        if normalize_volumes:
+            logger.warning("normalize_volumes=True is DEPRECATED. "
+                          "Using simple [0,1] -> [-1,1] scaling instead of instance normalization.")
     
     def _get_volume_memmap(self, path):
         """Get memory-mapped volume for efficient access"""
@@ -188,7 +196,10 @@ class OptimizedDentalSliceDataset(Dataset):
         return self.total_slices
     
     def get_volume_stats(self, volume, folder):
-        """Get or compute volume statistics for normalization"""
+        """
+        Get or compute volume statistics for normalization
+        DEPRECATED: Kept for backward compatibility but not used for actual normalization
+        """
         if folder not in self.volume_stats:
             mean = np.mean(volume)
             std = np.std(volume)
@@ -197,19 +208,27 @@ class OptimizedDentalSliceDataset(Dataset):
         return self.volume_stats[folder]
     
     def normalize_slice(self, slice_data, folder):
-        """Normalize slice using per-volume statistics with outlier handling"""
-        if self.normalize_volumes and folder in self.volume_stats:
-            stats = self.volume_stats[folder]
-            slice_data = (slice_data - stats['mean']) / stats['std']
-            slice_data = np.clip(slice_data, -5.0, 5.0)
+        """
+        Normalize slice - FIXED: Simple [0,1] -> [-1,1] scaling only
+        
+        이전 방식 (제거됨): 통계 기반 정규화 (Instance Norm)
+        새 방식: 데이터가 이미 [0, 1] 범위라고 가정하고 [-1, 1]로 매핑만 수행
+        """
+        # [수정]: 통계 기반 정규화 제거, 단순 스케일링만 수행
+        slice_data = (slice_data * 2.0) - 1.0
+        slice_data = np.clip(slice_data, -1.0, 1.0)
         return slice_data
     
     def normalize_volume(self, volume, folder):
-        """Normalize volume using per-volume statistics with outlier handling"""
-        if self.normalize_volumes:
-            stats = self.get_volume_stats(volume, folder)
-            volume = (volume - stats['mean']) / stats['std']
-            volume = np.clip(volume, -5.0, 5.0)
+        """
+        Normalize volume - FIXED: Simple [0,1] -> [-1,1] scaling only
+        
+        이전 방식 (제거됨): 통계 기반 정규화 (Instance Norm) - 환자 간 밀도 차이 정보 파괴
+        새 방식: 데이터가 이미 [0, 1] 범위라고 가정하고 [-1, 1]로 매핑만 수행
+        """
+        # [수정]: 통계 기반 정규화 제거, 단순 스케일링만 수행
+        volume = (volume * 2.0) - 1.0
+        volume = np.clip(volume, -1.0, 1.0)
         return volume
     
     def safe_normalize_tensor(self, tensor):
@@ -292,10 +311,8 @@ class OptimizedDentalSliceDataset(Dataset):
                 try:
                     pano_volume = self._get_volume_cached(pano_path, folder + '_pano')
                     if pano_volume is not None:
-                        if self.normalize_volumes:
-                            if folder + '_pano' not in self.volume_stats:
-                                self.get_volume_stats(pano_volume, folder + '_pano')
                         pano_2d = self.extract_panorama(pano_volume, pano_volume, idx)
+                        # [수정]: 단순 스케일링 적용
                         if self.normalize_volumes:
                             pano_2d = self.normalize_slice(pano_2d, folder + '_pano')
                     else:
@@ -308,10 +325,8 @@ class OptimizedDentalSliceDataset(Dataset):
                 try:
                     ct_volume = self._get_volume_cached(ct_path, folder)
                     if ct_volume is not None:
-                        if self.normalize_volumes:
-                            if folder not in self.volume_stats:
-                                self.get_volume_stats(ct_volume, folder)
                         pano_2d = self.extract_panorama(ct_volume, ct_volume, idx)
+                        # [수정]: 단순 스케일링 적용
                         if self.normalize_volumes:
                             pano_2d = self.normalize_slice(pano_2d, folder)
                     else:
@@ -351,23 +366,15 @@ class OptimizedDentalSliceDataset(Dataset):
         folder = self.folders[volume_idx]
         ct_path = os.path.join(self.root_dir, folder, 'CT', 'CT_Normalized_float32_200x200x120.raw')
         
-        # Initialize volume stats if needed
-        if self.normalize_volumes and folder not in self.volume_stats:
-            ct_volume = self._get_volume_cached(ct_path, folder)
-            if ct_volume is not None:
-                self.get_volume_stats(ct_volume, folder)
-        
         # Get 3-slice CT window
         ct_window = self._get_3slice_window(ct_path, folder, slice_idx)
         if ct_window is None:
             logger.error(f"Failed to load CT window: {ct_path}, slice {slice_idx}")
             return self._get_item_with_retry((idx + 1) % len(self), retry_count + 1)
         
-        # Normalize if needed
-        if self.normalize_volumes and folder in self.volume_stats:
-            stats = self.volume_stats[folder]
-            ct_window = (ct_window - stats['mean']) / stats['std']
-            ct_window = np.clip(ct_window, -5.0, 5.0)
+        # [수정]: 단순 스케일링만 적용 - 통계 기반 정규화 제거
+        if self.normalize_volumes:
+            ct_window = self.normalize_volume(ct_window, folder)
         
         # Get 3-slice panorama condition
         pano_window = self._get_pano_3window(volume_idx, slice_idx)
@@ -386,13 +393,13 @@ class OptimizedDentalSliceDataset(Dataset):
         # Panorama: [3, H, W] stays as is for condition
         pano_tensor = torch.from_numpy(pano_window.copy()).float()  # [3, H, W]
         
-        # Scale to [-1, 1] range
+        # [수정]: normalize_volumes 플래그와 상관없이 이미 [-1, 1] 범위로 변환됨
+        # 추가 스케일링 불필요 - 이미 normalize_volume/normalize_slice에서 처리됨
         if not self.normalize_volumes:
-            pano_tensor = (pano_tensor - 0.5) * 2
-            ct_tensor = (ct_tensor - 0.5) * 2
-        else:
-            pano_tensor = pano_tensor / 5.0
-            ct_tensor = ct_tensor / 5.0
+            # normalize_volumes=False인 경우에만 추가 스케일링
+            # 데이터가 [0, 1] 범위라고 가정
+            pano_tensor = (pano_tensor * 2.0) - 1.0
+            ct_tensor = (ct_tensor * 2.0) - 1.0
         
         pano_tensor = torch.clamp(pano_tensor, -1.0, 1.0)
         ct_tensor = torch.clamp(ct_tensor, -1.0, 1.0)

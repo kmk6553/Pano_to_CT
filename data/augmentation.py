@@ -1,5 +1,9 @@
 """
 Data augmentation utilities for both CPU and GPU
+
+FIXES APPLIED:
+1. GT CT(Target)에는 Intensity Augmentation 적용 금지
+2. Geometric 변환은 유지하되, 밝기/노이즈 변환은 Condition(Pano)에만 적용
 """
 
 import torch
@@ -117,7 +121,7 @@ class DataAugmentation:
         return image, pano
     
     def gamma_correction(self, image):
-        """Random gamma correction"""
+        """Random gamma correction - [수정]: Pano에만 적용"""
         if np.random.rand() > 0.8:
             gamma = np.random.uniform(0.9, 1.1)
             img_min, img_max = image.min(), image.max()
@@ -128,7 +132,7 @@ class DataAugmentation:
         return image
     
     def random_noise(self, image):
-        """Add random Gaussian noise"""
+        """Add random Gaussian noise - [수정]: Pano에만 적용"""
         if np.random.rand() > 0.9:
             noise_std = np.random.uniform(0.005, 0.02)
             noise = np.random.normal(0, noise_std, image.shape)
@@ -136,15 +140,22 @@ class DataAugmentation:
         return image
     
     def apply(self, image, pano, epoch=None):
-        """Apply all augmentations"""
+        """
+        Apply all augmentations
+        
+        [수정]: Intensity augmentation (gamma, noise)는 Pano에만 적용
+        Target CT는 기하학적 변환만 유지
+        """
         # Geometric augmentations (apply to both)
         image, pano = self.random_flip(image, pano)
         image, pano = self.random_rotation(image, pano)
         image, pano = self.elastic_deformation(image, pano, epoch)
         
-        # Intensity augmentations (apply only to image)
-        image = self.gamma_correction(image)
-        image = self.random_noise(image)
+        # [수정]: Intensity augmentations - Pano에만 적용, Target CT는 제외
+        # image = self.gamma_correction(image)  # 제거
+        # image = self.random_noise(image)  # 제거
+        pano = self.gamma_correction(pano)  # Pano에만 적용
+        pano = self.random_noise(pano)  # Pano에만 적용
         
         return image, pano
 
@@ -187,14 +198,22 @@ class StableElasticTransform(K.RandomElasticTransform):
 # ==================== GPU Augmentation Module ====================
 
 class GPUAugmentation(nn.Module):
-    """GPU-based augmentation using Kornia - Fixed version with same parameters for all inputs"""
+    """
+    GPU-based augmentation using Kornia
+    
+    FIXES APPLIED:
+    1. Target(image)에는 Intensity Augmentation 적용 금지
+    2. Geometric 변환만 Target에 적용
+    3. Intensity 변환은 Condition(Pano)에만 적용
+    """
     def __init__(self, config, device='cuda'):
         super().__init__()
         self.device = device
         self.config = config
         self.debug = config.get('debug_augmentation', False)
         self.augment_from_epoch = config.get('augment_from_epoch', 10)
-        self.intensity_to_condition = config.get('intensity_to_condition', True)
+        # [수정]: intensity_to_condition 옵션은 이제 무시됨 - 항상 condition에만 적용
+        # self.intensity_to_condition = config.get('intensity_to_condition', True)
         
         if not KORNIA_AVAILABLE:
             self.use_gpu_aug = False
@@ -240,7 +259,7 @@ class GPUAugmentation(nn.Module):
             keepdim=True
         ).to(device) if geometric_transforms else None
         
-        # Intensity augmentations (only for CT slices)
+        # Intensity augmentations (only for Condition/Pano, NOT for Target/CT)
         intensity_transforms = []
         
         # Safe gamma correction
@@ -258,16 +277,30 @@ class GPUAugmentation(nn.Module):
             keepdim=True
         ).to(device) if intensity_transforms else None        
 
-
         # For progressive augmentation
         self.base_elastic_alpha = config.get('elastic_alpha', 10)
         self.base_noise_std = 0.01
         
-        logger.info(f"GPU Augmentation initialized with {len(geometric_transforms)} geometric and {len(intensity_transforms)} intensity transforms")
+        logger.info(f"GPU Augmentation initialized with {len(geometric_transforms)} geometric transforms")
+        logger.info(f"Intensity transforms ({len(intensity_transforms)} total) will be applied to CONDITION ONLY")
     
     @torch.no_grad()
     def forward(self, image, condition=None, epoch=None):
-        """Apply GPU augmentation to image and optionally condition - FIXED VERSION"""
+        """
+        Apply GPU augmentation to image and optionally condition
+        
+        [수정]: Target(image)에는 Geometric 변환만 적용
+                Intensity Augmentation은 Condition(Pano)에만 적용
+        
+        Args:
+            image: [B, C, H, W] or [B, D, H, W] - Target CT (D=3 for 3-slice)
+            condition: [B, 3, H, W] - Condition Pano (3-channel)
+            epoch: Current epoch for progressive augmentation
+        
+        Returns:
+            image_aug: Augmented target (geometric only)
+            condition_aug: Augmented condition (geometric + intensity)
+        """
         if not self.use_gpu_aug:
             return image, condition
         
@@ -283,31 +316,20 @@ class GPUAugmentation(nn.Module):
             condition = condition.to(self.device)
             condition = torch.clamp(condition, -1.0, 1.0)
         
-        # Calculate augmentation strength based on epoch (progressive)
-        if epoch is not None:
-            strength = min(1.0, (epoch - self.augment_from_epoch + 1) / 10.0)  # Ramp up over 10 epochs
-        else:
-            strength = 1.0
-        
         try:
-            # Apply geometric augmentations with SAME parameters
+            # ============================================================
+            # [수정]: Geometric augmentation - 동일한 파라미터로 둘 다 적용
+            # ============================================================
             if self.geometric_augmentation is not None and condition is not None:
-                # CRITICAL FIX: Always use same parameters for both image and condition
+                # Sample parameters once
                 params = self.geometric_augmentation.forward_parameters(image.shape)
                 
+                # Apply geometric transform to target (CT)
                 image_geom = self.geometric_augmentation(image, params=params)
                 
-                # Handle different channel counts by expanding/contracting as needed
-                if condition.shape[1] != image.shape[1]:
-                    # If condition has different channels, we need to handle it carefully
-                    if condition.shape[1] == 3 and image.shape[1] == 1:
-                        # For 3-channel condition, apply same transform to each channel
-                        condition_geom = self.geometric_augmentation(condition, params=params)
-                    else:
-                        # General case - apply same spatial transform
-                        condition_geom = self.geometric_augmentation(condition, params=params)
-                else:
-                    condition_geom = self.geometric_augmentation(condition, params=params)
+                # Apply same geometric transform to condition (Pano)
+                condition_geom = self.geometric_augmentation(condition, params=params)
+                
             elif self.geometric_augmentation is not None:
                 image_geom = self.geometric_augmentation(image)
                 condition_geom = condition
@@ -315,46 +337,37 @@ class GPUAugmentation(nn.Module):
                 image_geom = image
                 condition_geom = condition
             
-            # Apply intensity augmentations only to the image
-            if self.intensity_augmentation is not None:
-                # Check for negative values before intensity augmentation
-                if self.debug and (image_geom < 0).any():
-                    neg_ratio = (image_geom < 0).float().mean().item()
-                    logger.debug(f"Negative values before intensity aug: {neg_ratio*100:.2f}%")
-                
-                # ✅ 파라미터를 한 번만 샘플링
-                params_intensity = self.intensity_augmentation.forward_parameters(image_geom.shape)
-                
-                # ✅ Image에 적용 (같은 params)
-                image_aug = self.intensity_augmentation(image_geom, params=params_intensity)
-
-                # ✅ Condition에도 동일한 params 적용
-                if condition_geom is not None and self.intensity_to_condition:
-                    condition_geom = self.intensity_augmentation(condition_geom, params=params_intensity)
-             
+            # ============================================================
+            # [수정]: Intensity augmentation - Condition(Pano)에만 적용
+            # Target(CT)에는 Intensity Augmentation 적용하지 않음!
+            # ============================================================
+            image_aug = image_geom  # Target은 geometric만 적용
+            
+            if self.intensity_augmentation is not None and condition_geom is not None:
+                # Intensity는 Condition에만 적용
+                params_intensity = self.intensity_augmentation.forward_parameters(condition_geom.shape)
+                condition_aug = self.intensity_augmentation(condition_geom, params=params_intensity)
             else:
-                image_aug = image_geom
+                condition_aug = condition_geom
             
             # Safety checks and recovery
-            # Use nan_to_num for robust handling
             image_aug = torch.nan_to_num(image_aug, nan=0.0, posinf=1.0, neginf=-1.0)
-            if condition_geom is not None:
-                condition_geom = torch.nan_to_num(condition_geom, nan=0.0, posinf=1.0, neginf=-1.0)
+            if condition_aug is not None:
+                condition_aug = torch.nan_to_num(condition_aug, nan=0.0, posinf=1.0, neginf=-1.0)
             
             # Final clamping
             image_aug = torch.clamp(image_aug, -1.0, 1.0)
-            if condition_geom is not None:
-                condition_geom = torch.clamp(condition_geom, -1.0, 1.0)
+            if condition_aug is not None:
+                condition_aug = torch.clamp(condition_aug, -1.0, 1.0)
             
             # Debug logging
             if self.debug and epoch is not None and epoch % 10 == 0:
                 logger.info(f"Augmentation stats at epoch {epoch}:")
-                logger.info(f"  Image range: [{image_aug.min():.4f}, {image_aug.max():.4f}]")
-                if condition_geom is not None:
-                    logger.info(f"  Condition range: [{condition_geom.min():.4f}, {condition_geom.max():.4f}]")
-                logger.info(f"  Augmentation strength: {strength:.2f}")
+                logger.info(f"  Image (Target) range: [{image_aug.min():.4f}, {image_aug.max():.4f}] (Geometric only)")
+                if condition_aug is not None:
+                    logger.info(f"  Condition (Pano) range: [{condition_aug.min():.4f}, {condition_aug.max():.4f}] (Geometric + Intensity)")
             
-            return image_aug, condition_geom
+            return image_aug, condition_aug
             
         except Exception as e:
             logger.error(f"Error in GPU augmentation: {str(e)}")

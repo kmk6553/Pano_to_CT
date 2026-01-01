@@ -2,8 +2,9 @@
 3D Diffusion model components with Multi-scale Spatial Conditioning and Position Embedding
 Processes 3D latent volumes [B, C, D=3, h, w]
 
-UPDATES:
-- Added AttentionBlock3D to middle blocks for improved Z-axis consistency
+FIXES APPLIED:
+1. ConditionEncoder3D - 가운데 슬라이드만 사용하는 대신 3장 슬라이드 평균(Mean) 사용
+2. AttentionBlock3D를 middle blocks에 추가하여 Z-axis consistency 향상
 """
 
 import torch
@@ -184,6 +185,10 @@ class ConditionEncoder3D(nn.Module):
     
     Strategy: Process each slice with shared 2D encoder, then stack to 3D
     This is more efficient than full 3D convolution on condition
+    
+    FIXES APPLIED:
+    1. Global Feature 생성 시 가운데 슬라이드([:, 1])만 사용하는 대신 
+       3장 슬라이드 정보의 평균(Mean) 사용하여 3D 맥락 유지
     """
     def __init__(self, in_channels=3, base_channels=64, out_channels=512):
         super().__init__()
@@ -274,10 +279,15 @@ class ConditionEncoder3D(nn.Module):
             h_3d = h.reshape(b, d, c, hh, ww).permute(0, 2, 1, 3, 4)  # [B, C, D, h, w]
             spatial_features.append(h_3d)
         
-        # Global condition from the last level
-        # Use middle slice for global context
-        h_middle = h.reshape(b, d, -1, h.shape[-2], h.shape[-1])[:, 1]  # [B, C, h, w]
-        global_cond = self.global_pool(h_middle)
+        # ============================================================
+        # [수정]: Global condition - 가운데 슬라이드만 사용하는 대신 
+        #         3장 슬라이드 정보의 평균(Mean) 사용하여 3D 맥락 유지
+        # ============================================================
+        # 기존: h_middle = h.reshape(b, d, -1, h.shape[-2], h.shape[-1])[:, 1]
+        # 수정: Depth 차원(dim=1)에 대해 평균 Pool 사용
+        h_3d_last = h.reshape(b, d, -1, h.shape[-2], h.shape[-1])  # [B, D, C, h, w]
+        h_global_feat = h_3d_last.mean(dim=1)  # [B, C, h, w] - 3개 슬라이드 평균
+        global_cond = self.global_pool(h_global_feat)  # [B, out_channels]
         
         return spatial_features, global_cond
 
@@ -366,14 +376,11 @@ class ConditionalUNet3D(nn.Module):
             
             self.down_blocks.append(nn.ModuleList(layers))
         
-        # ============================================================
-        # UPDATED: Middle blocks with Self-Attention for Z-axis consistency
-        # Added AttentionBlock3D between ConditionalResBlock3D layers
-        # ============================================================
+        # Middle blocks with Self-Attention for Z-axis consistency
         spatial_ch = cond_channels
         self.mid_blocks = nn.ModuleList([
             ConditionalResBlock3D(ch, ch, time_dim, cond_channels, spatial_ch),
-            AttentionBlock3D(ch),  # <--- Self-Attention 추가
+            AttentionBlock3D(ch),  # Self-Attention 추가
             ConditionalResBlock3D(ch, ch, time_dim, cond_channels, spatial_ch)
         ])
         
@@ -470,10 +477,7 @@ class ConditionalUNet3D(nn.Module):
                 elif isinstance(layer, Downsample3D):
                     h = layer(h)
         
-        # ============================================================
-        # UPDATED: Middle with spatial conditioning and Self-Attention
-        # Handle both ConditionalResBlock3D and AttentionBlock3D
-        # ============================================================
+        # Middle with spatial conditioning and Self-Attention
         spatial_cond = self.spatial_injectors[-1](spatial_features[-1], h.shape[2:])
         for layer in self.mid_blocks:
             if isinstance(layer, ConditionalResBlock3D):

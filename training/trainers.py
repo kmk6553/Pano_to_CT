@@ -10,6 +10,7 @@ FIXES APPLIED:
 5. 모든 3개 슬라이스에 보조 손실 함수(LPIPS, L1, GDL) 적용 (v5.2)
 6. compute_3d_loss 스케일 오류 수정 - 분모에 C 포함 (v5.4)
 7. Image-space 보조 loss에 mid_weight 적용 (MSE는 균등 유지) (v5.4)
+8. [신규] VAE 학습에 GDL 추가 및 균등 가중치(Equal Weight) 적용 (v5.5)
 """
 
 import torch
@@ -85,22 +86,28 @@ def check_gradient_health(model, clip_value=1.0, epoch=1, batch_idx=0, debug=Fal
     }
 
 
-def compute_3d_loss(pred, target, mid_weight=0.5):
+def compute_3d_loss(pred, target, mid_weight=None):
     """
     Compute loss for 3D volumes with optional mid-slice weighting
     
     Args:
         pred: [B, C, D=3, H, W] - predicted volume (C can be 1 for image or z_ch for latent)
         target: [B, C, D=3, H, W] - target volume
-        mid_weight: Weight for middle slice (0.33=equal, 0.5=mid focused)
+        mid_weight: Weight for middle slice (None=equal, 0.5=mid focused)
+                    [수정] VAE 학습 시 None 사용하면 균등 가중치
     
     Returns:
         Weighted MSE loss (properly scaled)
     
     FIXED (v5.4): 분모에 C(채널) 포함하여 스케일 정확하게 계산
+    FIXED (v5.5): mid_weight=None일 때 균등 가중치 (1/3) 사용
     """
     # Base MSE on all slices (element-wise)
     mse_all = F.mse_loss(pred, target, reduction='none')
+    
+    # [수정]: mid_weight가 None이면 균등 가중치 사용
+    if mid_weight is None:
+        mid_weight = 1/3  # 균등 가중치
     
     if mid_weight != 1/3:
         # Apply slice-wise weighting: [prev, mid, next]
@@ -114,14 +121,8 @@ def compute_3d_loss(pred, target, mid_weight=0.5):
         # Apply weights
         mse_weighted = mse_all * weights
         
-        # ============================================================
-        # FIX (v5.4): 분모에 모든 차원 포함 (B, C, D, H, W)
-        # 기존: weights.sum() * B * H * W (C 누락!)
-        # 수정: weights.sum() * B * C * H * W 또는 numel() 기반
-        # ============================================================
+        # FIXED (v5.4): 분모에 모든 차원 포함 (B, C, D, H, W)
         B, C, D, H, W = pred.shape
-        # weights.sum() = side_weight + mid_weight + side_weight = 1.0
-        # 따라서 분모는 B * C * H * W (D는 weights로 이미 반영됨)
         denominator = weights.sum() * B * C * H * W
         return mse_weighted.sum() / denominator
     else:
@@ -144,7 +145,7 @@ def flatten_3d_to_4d(volume):
     return volume.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
 
 
-def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=0.5):
+def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=None):
     """
     Compute loss with slice-wise weighting for 3D volumes
     
@@ -152,16 +153,16 @@ def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=0.5):
         pred: [B, C, D=3, H, W] - predicted volume
         target: [B, C, D=3, H, W] - target volume
         loss_fn: Loss function that takes (pred, target) and returns scalar
-        mid_weight: Weight for middle slice (0.33=equal, 0.5=mid focused)
+        mid_weight: Weight for middle slice (None=equal, 0.5=mid focused)
+                    [수정] VAE 학습 시 None 사용하면 균등 가중치
     
     Returns:
         Weighted loss scalar
-    
-    NOTE: MSE(노이즈 예측)는 균등하게 유지하고, 
-          image-space 보조 loss에만 mid_weight를 적용하는 것이 권장됨.
-          - prev/next 학습도 z-연속성에 기여
-          - 하지만 최종 출력은 mid 위주이므로 mid에 약간의 가중치 부여가 타당
     """
+    # [수정]: mid_weight가 None이면 균등 가중치 사용
+    if mid_weight is None:
+        mid_weight = 1/3  # 균등 가중치
+    
     # Slice weights: [prev, mid, next]
     side_weight = (1 - mid_weight) / 2
     slice_weights = [side_weight, mid_weight, side_weight]
@@ -180,27 +181,45 @@ def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=0.5):
 
 def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, config, metrics_tracker, 
               lpips_loss_fn=None, lpips_weight=0.1, scaler=None, accumulation_steps=1,
-              gpu_augmenter=None):
+              gpu_augmenter=None, gdl_loss_fn=None, gdl_weight=0.0):
     """
     Optimized 3D VAE training with async prefetching and GPU augmentation
     
     Processes 3-slice windows: [B, 1, D=3, H, W]
     
-    UPDATED (v5.2): LPIPS Loss is now applied to all 3 slices
-    UPDATED (v5.4): LPIPS Loss uses mid_weight for slice weighting
+    FIXES APPLIED:
+    1. [수정 v5.2]: LPIPS Loss is now applied to all 3 slices
+    2. [수정 v5.5]: VAE 학습 시 균등 가중치(Equal Weight) 사용 - mid_weight=None
+    3. [수정 v5.5]: GDL(Gradient Difference Loss) 추가
+    
+    Args:
+        gdl_loss_fn: GradientDifferenceLoss 인스턴스 (None이면 비활성화)
+        gdl_weight: GDL loss 가중치 (0이면 비활성화)
     """
     vae.train()
     total_loss = 0
     recon_losses = []
     kl_losses = []
     lpips_losses = []
+    gdl_losses = []  # [추가] GDL loss 추적
     
     from losses.losses import StableKLLoss
     kl_loss_fn = StableKLLoss(free_bits=config['vae'].get('free_bits', 0.0))
     grad_clip_value = config['training'].get('grad_clip', 0.8)
     
-    # Mid-slice weight (higher = more focus on middle slice quality)
-    mid_weight = config['vae'].get('mid_slice_weight', 0.5)
+    # [수정 v5.5]: VAE 학습 시 균등 가중치 사용
+    # mid_weight를 None으로 설정하여 모든 슬라이스에 동일한 가중치 부여
+    # Z축 전체 복원이 중요하므로 mid_slice_weight 무시
+    current_mid_weight = None  # 균등 가중치 (1/3)
+    
+    # [기록용] 설정된 mid_weight 로깅
+    config_mid_weight = config['vae'].get('mid_slice_weight', 0.5)
+    if epoch == 1:
+        logger.info(f"VAE training config:")
+        logger.info(f"  - Config mid_slice_weight: {config_mid_weight} (IGNORED for VAE)")
+        logger.info(f"  - Actual mid_weight: Equal (1/3 for all slices)")
+        logger.info(f"  - GDL weight: {gdl_weight}")
+        logger.info(f"  - LPIPS weight: {lpips_weight}")
     
     optimizer.zero_grad()
     
@@ -264,24 +283,34 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     logger.warning(f"NaN/Inf in logvar at batch {i}")
                     continue
                 
-                # Reconstruction loss with mid-slice weighting (now properly scaled)
-                recon_loss = compute_3d_loss(recon, ct_volume, mid_weight=mid_weight)
+                # [수정 v5.5]: Reconstruction loss with 균등 가중치
+                recon_loss = compute_3d_loss(recon, ct_volume, mid_weight=current_mid_weight)
                 recon_loss = torch.maximum(recon_loss, torch.tensor(1e-6, device=device))
                 
                 # KL loss
                 kl_loss = kl_loss_fn(mean, logvar)
                 
-                # ============================================================
-                # FIX (v5.4): LPIPS loss with mid_weight applied
-                # ============================================================
+                # Initialize total loss
+                loss = recon_loss + beta * kl_loss
+                
+                # [수정 v5.5]: GDL Loss 추가 (균등 가중치)
+                if gdl_loss_fn is not None and gdl_weight > 0:
+                    gdl_loss = compute_slicewise_weighted_loss(
+                        recon, ct_volume, gdl_loss_fn, mid_weight=current_mid_weight
+                    )
+                    loss = loss + gdl_weight * gdl_loss
+                    gdl_losses.append(gdl_loss.item())
+                else:
+                    gdl_losses.append(0.0)
+                
+                # LPIPS loss (균등 가중치)
                 if lpips_loss_fn is not None and lpips_weight > 0 and epoch > 20:
                     lpips_loss = compute_slicewise_weighted_loss(
-                        recon, ct_volume, lpips_loss_fn, mid_weight=mid_weight
+                        recon, ct_volume, lpips_loss_fn, mid_weight=current_mid_weight
                     )
-                    loss = recon_loss + beta * kl_loss + lpips_weight * lpips_loss
+                    loss = loss + lpips_weight * lpips_loss
                     lpips_losses.append(lpips_loss.item())
                 else:
-                    loss = recon_loss + beta * kl_loss
                     lpips_losses.append(0.0)
                 
                 loss = loss / accumulation_steps
@@ -348,6 +377,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
             'loss': actual_loss,
             'recon': recon_loss.item(),
             'kl': kl_loss.item(),
+            'gdl': gdl_losses[-1] if gdl_losses else 0.0,
             'beta': beta,
             'lr': optimizer.param_groups[0]['lr'],
             'grad': grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm,
@@ -375,6 +405,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     avg_recon = np.mean(recon_losses) if recon_losses else 0
     avg_kl = np.mean(kl_losses) if kl_losses else 0
     avg_lpips = np.mean(lpips_losses) if lpips_losses else 0
+    avg_gdl = np.mean(gdl_losses) if gdl_losses else 0  # [추가]
     
     metrics_tracker.update('vae', train_loss=avg_loss, recon_loss=avg_recon, 
                           kl_loss=avg_kl, lpips_loss=avg_lpips)
@@ -383,10 +414,12 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                             recon_loss=avg_recon, 
                             kl_loss=avg_kl,
                             lpips_loss=avg_lpips,
+                            gdl_loss=avg_gdl,  # [추가]
                             beta=beta,
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
-                            skipped_steps=skipped_steps)
+                            skipped_steps=skipped_steps,
+                            mid_weight='equal')  # [추가] 균등 가중치 사용 로깅
     
     return avg_loss, avg_recon, avg_kl
 
@@ -558,10 +591,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 else:
                     raise ValueError(f"Unknown prediction type: {diffusion_process.prediction_type}")
                 
-                # ============================================================
                 # MSE loss: UNIFORM weighting (not mid_weight)
-                # 이유: prev/next 학습이 z-연속성에 기여하므로 균등하게 유지
-                # ============================================================
                 mse_loss = F.mse_loss(model_output, target)
                 
                 # Warning for high MSE
@@ -601,10 +631,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                     optimizer.zero_grad()
                     continue
                 
-                # ============================================================
-                # FIX (v5.4): Image-space 보조 loss에 mid_weight 적용
-                # MSE는 균등(z-연속성), image-space는 mid 가중(최종 품질)
-                # ============================================================
+                # Image-space 보조 loss에 mid_weight 적용
                 
                 # L1 Loss with mid_weight
                 if l1_weight > 0:

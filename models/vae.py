@@ -1,6 +1,10 @@
 """
 3D Variational Autoencoder (VAE) components for Slab-based generation
 Processes 3-slice windows as volumetric data [B, 1, D=3, H, W]
+
+FIXES APPLIED:
+1. AttentionBlock3D 임계값 4096 -> 15000 상향
+2. Flash Attention (F.scaled_dot_product_attention) 사용으로 원본 해상도 유지
 """
 
 import torch
@@ -36,7 +40,13 @@ class ResidualBlock3D(nn.Module):
 
 
 class AttentionBlock3D(nn.Module):
-    """3D Attention Block - processes depth dimension efficiently"""
+    """
+    3D Attention Block - processes depth dimension efficiently
+    
+    FIXES APPLIED:
+    1. Downsampling 임계값 4096 -> 15000 상향
+    2. Flash Attention (F.scaled_dot_product_attention) 사용으로 원본 해상도 유지
+    """
     def __init__(self, channels):
         super().__init__()
         self.norm = nn.GroupNorm(32, channels)
@@ -53,48 +63,50 @@ class AttentionBlock3D(nn.Module):
         v = self.v(h_)
         
         b, c, d, h, w = q.shape
-        
-        # Flatten spatial dimensions for attention
-        # [B, C, D, H, W] -> [B, C, D*H*W]
-        q = q.view(b, c, -1)  # [B, C, D*H*W]
-        k = k.view(b, c, -1)  # [B, C, D*H*W]
-        v = v.view(b, c, -1)  # [B, C, D*H*W]
-        
-        # For efficiency with D=3, we can compute full attention
-        # If D*H*W is too large, use chunked attention
         spatial_size = d * h * w
         
-        if spatial_size > 4096:
-            # Use approximate attention for large spatial sizes
+        # [수정]: Threshold 4096 -> 15000 상향
+        if spatial_size > 15000:
+            # Approximate attention for very large spatial sizes
             # Downsample for attention computation
-            target_size = int(np.cbrt(4096))
+            target_size = int(np.cbrt(15000))
             x_small = F.interpolate(h_, size=(min(d, target_size), target_size, target_size), 
                                    mode='trilinear', align_corners=False)
             
-            q_small = self.q(x_small).view(b, c, -1)
-            k_small = self.k(x_small).view(b, c, -1)
-            v_small = self.v(x_small).view(b, c, -1)
+            q_small = self.q(x_small)
+            k_small = self.k(x_small)
+            v_small = self.v(x_small)
             
-            # Compute attention on smaller resolution
-            attn = torch.bmm(q_small.transpose(1, 2), k_small) * self.scale
-            attn = F.softmax(attn, dim=-1)
+            b_s, c_s, d_s, h_s, w_s = q_small.shape
             
-            out_small = torch.bmm(v_small, attn.transpose(1, 2))
-            out_small = out_small.view(b, c, min(d, target_size), target_size, target_size)
+            # Reshape for attention: [B, C, D*H*W] -> [B, D*H*W, C]
+            q_small = q_small.view(b_s, c_s, -1).permute(0, 2, 1)  # [B, N, C]
+            k_small = k_small.view(b_s, c_s, -1).permute(0, 2, 1)  # [B, N, C]
+            v_small = v_small.view(b_s, c_s, -1).permute(0, 2, 1)  # [B, N, C]
             
-            # Upsample back
+            # [수정]: Flash Attention 사용
+            out_small = F.scaled_dot_product_attention(q_small, k_small, v_small)
+            
+            # Reshape back: [B, N, C] -> [B, C, D, H, W]
+            out_small = out_small.permute(0, 2, 1).view(b_s, c_s, d_s, h_s, w_s)
+            out_small = self.proj_out(out_small)
+            
+            # Upsample back to original resolution
             out = F.interpolate(out_small, size=(d, h, w), mode='trilinear', align_corners=False)
         else:
-            # Full attention for small spatial sizes
-            # [B, D*H*W, C] @ [B, C, D*H*W] -> [B, D*H*W, D*H*W]
-            attn = torch.bmm(q.transpose(1, 2), k) * self.scale
-            attn = F.softmax(attn, dim=-1)
+            # [수정]: Full Resolution Attention with Flash Attention
+            # Reshape for attention: [B, C, D*H*W] -> [B, D*H*W, C]
+            q = q.view(b, c, -1).permute(0, 2, 1)  # [B, N, C]
+            k = k.view(b, c, -1).permute(0, 2, 1)  # [B, N, C]
+            v = v.view(b, c, -1).permute(0, 2, 1)  # [B, N, C]
             
-            # [B, C, D*H*W] @ [B, D*H*W, D*H*W] -> [B, C, D*H*W]
-            out = torch.bmm(v, attn.transpose(1, 2))
-            out = out.view(b, c, d, h, w)
+            # [수정]: Flash Attention 사용 (메모리 효율적, 빠름)
+            out = F.scaled_dot_product_attention(q, k, v)
+            
+            # Reshape back: [B, N, C] -> [B, C, D, H, W]
+            out = out.permute(0, 2, 1).view(b, c, d, h, w)
+            out = self.proj_out(out)
         
-        out = self.proj_out(out)
         return x + out
 
 

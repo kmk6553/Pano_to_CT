@@ -8,6 +8,8 @@ Generates 3 slices simultaneously for improved z-axis consistency
 FIXES APPLIED:
 1. GPU Augmentation 사용 시 CPU Augmentation 비활성화
 2. Scale factor 설정 추가 (config['model']['scale_factor'])
+3. [신규] VAE 학습에 gdl_loss_fn 전달
+4. [신규] normalize_volumes 옵션 경고 메시지 추가
 """
 
 import torch
@@ -140,11 +142,6 @@ def main(args):
                 'vae_channels': args.vae_channels,
                 'diffusion_channels': args.diffusion_channels,
                 'cond_channels': args.cond_channels,
-                # ============================================================
-                # FIX 1: Scale factor 설정 추가
-                # 기본값 0.18215 (Stable Diffusion 표준)
-                # --auto_scale_factor 사용 시 VAE 학습 후 자동 계산
-                # ============================================================
                 'scale_factor': args.scale_factor,
                 'auto_scale_factor': args.auto_scale_factor
             },
@@ -163,7 +160,7 @@ def main(args):
                 'lpips_weight': args.lpips_weight,
                 'diffusion_lr': args.diffusion_lr,
                 'use_stochastic_encoding': args.use_stochastic_encoding,
-                'mid_slice_weight': args.mid_slice_weight  # Weight for middle slice in loss
+                'mid_slice_weight': args.mid_slice_weight
             },
             'vae': {
                 'beta_max': 0.0001,
@@ -172,10 +169,11 @@ def main(args):
                 'beta_cycle_length': 10,
                 'free_bits': 0.1,
                 'lpips_weight': args.vae_lpips_weight,
+                'gdl_weight': args.vae_gdl_weight,  # [추가] VAE GDL weight
                 'initial_lr': args.vae_lr,
                 'target_lr': max(args.vae_lr * 10, 0.0001),
                 'warmup_epochs': 5,
-                'mid_slice_weight': args.mid_slice_weight  # Weight for middle slice in loss
+                'mid_slice_weight': args.mid_slice_weight
             },
             'training': {
                 'batch_size': args.batch_size,
@@ -215,6 +213,19 @@ def main(args):
             'save_dir': args.save_dir
         }
     
+    # ============================================================
+    # [수정] normalize_volumes 옵션 경고 메시지
+    # ============================================================
+    if config['data']['normalize_volumes']:
+        logger.warning("="*60)
+        logger.warning("WARNING: --normalize_volumes is ENABLED")
+        logger.warning("="*60)
+        logger.warning("이 옵션은 더 이상 통계 기반 정규화(Instance Norm)를 수행하지 않습니다.")
+        logger.warning("대신 단순 [0,1] -> [-1,1] 스케일링만 적용됩니다.")
+        logger.warning("이는 환자 간 밀도 차이 정보를 보존하기 위함입니다.")
+        logger.warning("기존 동작을 원하시면 코드를 확인해 주세요.")
+        logger.warning("="*60 + "\n")
+    
     # Set seed and device
     set_seed(config['seed'])
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -239,7 +250,6 @@ def main(args):
                 logger.warning(f"BFloat16 requested but not supported on {gpu_name}. Falling back to Float16.")
                 config['training']['use_bfloat16'] = False
         
-        # Memory recommendations for 3D models (higher memory usage)
         if gpu_memory < 12:
             logger.warning(f"Low GPU memory detected ({gpu_memory:.1f}GB). 3D models require more memory.")
             logger.warning("Consider reducing batch size to 1-2 or using gradient accumulation.")
@@ -268,14 +278,11 @@ def main(args):
     logger.info("  - Reduced slice-to-slice artifacts")
     logger.info("="*60 + "\n")
     
-    # ============================================================
-    # FIX 2: GPU Augmentation 사용 시 CPU Augmentation 비활성화 결정
-    # ============================================================
+    # GPU Augmentation 사용 시 CPU Augmentation 비활성화 결정
     from data.augmentation import KORNIA_AVAILABLE
     
     use_gpu_aug = config['data']['use_gpu_augmentation'] and KORNIA_AVAILABLE
     
-    # CPU augmentation 플래그 결정
     if use_gpu_aug:
         logger.info("="*60)
         logger.info("AUGMENTATION CONFLICT PREVENTION")
@@ -315,7 +322,8 @@ def main(args):
     logger.info(f"Self-conditioning: {config['diffusion']['use_self_conditioning']} (prob={config['diffusion']['self_cond_prob']})")
     logger.info(f"CFG dropout: {config['diffusion']['cfg_dropout_prob']}")
     logger.info(f"CFG guidance scale: {config['diffusion']['guidance_scale']}")
-    logger.info(f"Mid-slice weight: {config['diffusion']['mid_slice_weight']}")
+    logger.info(f"Mid-slice weight (Diffusion): {config['diffusion']['mid_slice_weight']}")
+    logger.info(f"VAE GDL weight: {config['vae'].get('gdl_weight', 0.0)}")  # [추가]
     logger.info("="*60 + "\n")
     
     # Setup AMP
@@ -381,7 +389,6 @@ def main(args):
         channels=config['model']['vae_channels']
     ).to(device)
     
-    # Count parameters
     vae_params = sum(p.numel() for p in vae.parameters())
     logger.info(f"3D VAE parameters: {vae_params:,}")
     
@@ -391,7 +398,7 @@ def main(args):
         channels=config['model']['diffusion_channels'],
         cond_channels=config['model']['cond_channels'],
         panorama_type=config['data']['panorama_type'],
-        pano_triplet=True,  # Always True for 3D Slab
+        pano_triplet=True,
         use_self_conditioning=config['diffusion']['use_self_conditioning']
     ).to(device)
     
@@ -444,19 +451,16 @@ def main(args):
         gpu_augmenter = GPUAugmentation(config['data']['augmentation'], device).to(device)
         logger.info("GPU augmentation module initialized")
     
-    # ============================================================
-    # FIX 2 적용: GPU augmentation 사용 시 CPU augmentation 비활성화
-    # train_augment_cpu 플래그 사용
-    # ============================================================
+    # Create datasets
     train_dataset = OptimizedDentalSliceDataset(
         config['data']['data_dir'], 
         train_folders, 
         slice_range=config['data']['slice_range'],
-        augment=train_augment_cpu,  # GPU aug 사용 시 False
+        augment=train_augment_cpu,
         panorama_type=config['data']['panorama_type'],
         normalize_volumes=config['data']['normalize_volumes'],
         augment_config=config['data']['augmentation'] if train_augment_cpu else None,
-        pano_triplet=True,  # Always True for 3D Slab
+        pano_triplet=True,
         cache_volumes=config['data']['cache_volumes'],
         use_memmap=config['data'].get('use_memmap', True)
     )
@@ -468,7 +472,7 @@ def main(args):
         augment=False,
         panorama_type=config['data']['panorama_type'],
         normalize_volumes=config['data']['normalize_volumes'],
-        pano_triplet=True,  # Always True for 3D Slab
+        pano_triplet=True,
         cache_volumes=config['data']['cache_volumes'],
         use_memmap=config['data'].get('use_memmap', True)
     )
@@ -636,23 +640,31 @@ def main(args):
         logger.info("=== Phase 1: Training 3D VAE ===")
         logger.info("="*60)
         logger.info(f"Processing 3-slice windows: [B, 1, D=3, H, W]")
-        logger.info(f"Mid-slice weight: {config['vae']['mid_slice_weight']}")
+        logger.info(f"Slice weighting: EQUAL (1/3 for all slices)")  # [수정]
+        logger.info(f"GDL weight: {config['vae'].get('gdl_weight', 0.0)}")  # [추가]
+        logger.info(f"LPIPS weight: {config['vae']['lpips_weight']}")
         logger.info(f"Total epochs: {config['training']['vae_epochs']}")
         logger.info(f"Batch size: {config['training']['batch_size']}")
         logger.info(f"Effective batch size: {config['training']['batch_size'] * accumulation_steps}")
         logger.info("="*60 + "\n")
         
+        # [추가] VAE용 GDL loss weight
+        vae_gdl_weight = config['vae'].get('gdl_weight', 0.0)
+        
         for epoch in range(start_epoch, config['training']['vae_epochs'] + 1):
             if hasattr(train_dataset, 'set_epoch'):
                 train_dataset.set_epoch(epoch)
             
+            # [수정] gdl_loss_fn과 gdl_weight 전달
             vae_loss, recon_loss, kl_loss = train_vae_optimized(
                 vae, train_loader, vae_optimizer, vae_scheduler, device, epoch, config, metrics_tracker,
                 lpips_loss_fn=lpips_loss_fn if config['vae']['lpips_weight'] > 0 else None,
                 lpips_weight=config['vae']['lpips_weight'],
                 scaler=vae_scaler,
                 accumulation_steps=accumulation_steps,
-                gpu_augmenter=gpu_augmenter
+                gpu_augmenter=gpu_augmenter,
+                gdl_loss_fn=gdl_loss_fn if vae_gdl_weight > 0 else None,  # [추가]
+                gdl_weight=vae_gdl_weight  # [추가]
             )
             
             if np.isnan(vae_loss) or np.isinf(vae_loss):
@@ -688,9 +700,7 @@ def main(args):
             if epoch % 10 == 0:
                 torch.cuda.empty_cache()
         
-        # ============================================================
-        # FIX 1: VAE 학습 완료 후 Scale Factor 자동 계산 (옵션)
-        # ============================================================
+        # VAE 학습 완료 후 Scale Factor 자동 계산 (옵션)
         if config['model'].get('auto_scale_factor', False):
             logger.info("\n" + "="*60)
             logger.info("Computing Latent Scale Factor from trained VAE...")
@@ -700,10 +710,7 @@ def main(args):
                 vae, train_loader, device, num_samples=100
             )
             
-            # Config 업데이트
             config['model']['scale_factor'] = computed_scale_factor
-            
-            # Config 파일 다시 저장
             save_config(config, save_dir)
             
             logger.info(f"Updated scale_factor in config: {computed_scale_factor:.4f}")
@@ -711,7 +718,6 @@ def main(args):
     else:
         logger.info("\n=== Skipping VAE Training (Using loaded checkpoint) ===")
         
-        # VAE가 이미 학습된 경우에도 scale factor 계산 옵션
         if config['model'].get('auto_scale_factor', False):
             logger.info("Computing scale factor from loaded VAE...")
             computed_scale_factor = compute_latent_scale_factor(
@@ -732,7 +738,7 @@ def main(args):
     logger.info(f"Self-conditioning: {config['diffusion']['use_self_conditioning']}")
     logger.info(f"CFG dropout: {config['diffusion']['cfg_dropout_prob']}")
     logger.info(f"Guidance scale: {config['diffusion']['guidance_scale']}")
-    logger.info(f"Mid-slice weight: {config['diffusion']['mid_slice_weight']}")
+    logger.info(f"Mid-slice weight (image-space): {config['diffusion']['mid_slice_weight']}")
     logger.info(f"Latent scale factor: {config['model']['scale_factor']}")
     logger.info(f"Total epochs: {config['training']['diffusion_epochs']}")
     if diffusion_start_epoch > 1:
@@ -899,7 +905,7 @@ if __name__ == '__main__':
                        choices=['coronal', 'axial', 'mip', 'curved'],
                        help='Panorama extraction type')
     parser.add_argument('--normalize_volumes', action='store_true', default=False,
-                       help='Use per-volume normalization')
+                       help='Use per-volume normalization (DEPRECATED: now uses simple scaling)')
     parser.add_argument('--max_data_folders', type=int, default=500,
                        help='Maximum number of data folders to use')
     parser.add_argument('--cache_volumes', action='store_true', default=False,
@@ -917,9 +923,7 @@ if __name__ == '__main__':
     parser.add_argument('--diffusion_channels', type=int, default=128)
     parser.add_argument('--cond_channels', type=int, default=512)
     
-    # ============================================================
-    # FIX: Scale factor 인자 추가
-    # ============================================================
+    # Scale factor
     parser.add_argument('--scale_factor', type=float, default=0.18215,
                        help='Latent scaling factor (default: 0.18215, Stable Diffusion standard)')
     parser.add_argument('--auto_scale_factor', action='store_true', default=False,
@@ -944,10 +948,13 @@ if __name__ == '__main__':
     parser.add_argument('--gdl_weight', type=float, default=0.5)
     parser.add_argument('--lpips_weight', type=float, default=0.1)
     parser.add_argument('--mid_slice_weight', type=float, default=0.5,
-                       help='Weight for middle slice in 3D loss (0.33=equal, 0.5=mid focused)')
+                       help='Weight for middle slice in 3D loss (0.33=equal, 0.5=mid focused). '
+                            'Note: VAE training always uses equal weighting.')
     
     # VAE specific
     parser.add_argument('--vae_lpips_weight', type=float, default=0.1)
+    parser.add_argument('--vae_gdl_weight', type=float, default=0.1,
+                       help='GDL weight for VAE training (default: 0.1)')  # [추가]
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=2,

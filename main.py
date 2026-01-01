@@ -162,6 +162,7 @@ def main(args):
                 'gdl_weight': args.gdl_weight,
                 'lpips_weight': args.lpips_weight,
                 'diffusion_lr': args.diffusion_lr,
+                'use_stochastic_encoding': args.use_stochastic_encoding,
                 'mid_slice_weight': args.mid_slice_weight  # Weight for middle slice in loss
             },
             'vae': {
@@ -995,6 +996,10 @@ if __name__ == '__main__':
     # Augmentation
     parser.add_argument('--augment_from_epoch', type=int, default=10,
                        help='Start augmentation from this epoch')
+    
+    parser.add_argument('--use_stochastic_encoding', action='store_true', default=False,
+                   help='Use stochastic encoding (z=sample) instead of deterministic (z=mean). '
+                        'Default is deterministic for better structural accuracy.')
     
     args = parser.parse_args()
     main(args)

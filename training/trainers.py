@@ -4,9 +4,12 @@ Processes 3-slice windows: [B, 1, D=3, H, W]
 
 FIXES APPLIED:
 1. Latent Scaling - scale_factor 적용 (기본값 0.18215, Stable Diffusion 표준)
-2. VAE Sampling - mean 대신 sample(mean, logvar) 사용
+2. Deterministic Encoding - z = mean 사용 (구조 정확도 향상) (v5.3)
 3. Decode 전 Rescaling 적용
 4. GPU Augmentation 조건문 수정 - dataset.augment 플래그 제거 (v5.1)
+5. 모든 3개 슬라이스에 보조 손실 함수(LPIPS, L1, GDL) 적용 (v5.2)
+6. compute_3d_loss 스케일 오류 수정 - 분모에 C 포함 (v5.4)
+7. Image-space 보조 loss에 mid_weight 적용 (MSE는 균등 유지) (v5.4)
 """
 
 import torch
@@ -87,14 +90,16 @@ def compute_3d_loss(pred, target, mid_weight=0.5):
     Compute loss for 3D volumes with optional mid-slice weighting
     
     Args:
-        pred: [B, 1, D=3, H, W] - predicted volume
-        target: [B, 1, D=3, H, W] - target volume
-        mid_weight: Weight for middle slice (0.5 = equal weighting)
+        pred: [B, C, D=3, H, W] - predicted volume (C can be 1 for image or z_ch for latent)
+        target: [B, C, D=3, H, W] - target volume
+        mid_weight: Weight for middle slice (0.33=equal, 0.5=mid focused)
     
     Returns:
-        Weighted MSE loss
+        Weighted MSE loss (properly scaled)
+    
+    FIXED (v5.4): 분모에 C(채널) 포함하여 스케일 정확하게 계산
     """
-    # Base MSE on all slices
+    # Base MSE on all slices (element-wise)
     mse_all = F.mse_loss(pred, target, reduction='none')
     
     if mid_weight != 1/3:
@@ -108,9 +113,69 @@ def compute_3d_loss(pred, target, mid_weight=0.5):
         
         # Apply weights
         mse_weighted = mse_all * weights
-        return mse_weighted.sum() / (weights.sum() * pred.shape[0] * pred.shape[3] * pred.shape[4])
+        
+        # ============================================================
+        # FIX (v5.4): 분모에 모든 차원 포함 (B, C, D, H, W)
+        # 기존: weights.sum() * B * H * W (C 누락!)
+        # 수정: weights.sum() * B * C * H * W 또는 numel() 기반
+        # ============================================================
+        B, C, D, H, W = pred.shape
+        # weights.sum() = side_weight + mid_weight + side_weight = 1.0
+        # 따라서 분모는 B * C * H * W (D는 weights로 이미 반영됨)
+        denominator = weights.sum() * B * C * H * W
+        return mse_weighted.sum() / denominator
     else:
+        # Equal weighting: just use standard mean
         return mse_all.mean()
+
+
+def flatten_3d_to_4d(volume):
+    """
+    Flatten 5D volume [B, C, D=3, H, W] to 4D [B*D, C, H, W] for 2D loss functions
+    
+    Args:
+        volume: [B, C, D=3, H, W] tensor
+    
+    Returns:
+        [B*D, C, H, W] tensor
+    """
+    B, C, D, H, W = volume.shape
+    # Permute to [B, D, C, H, W] then reshape to [B*D, C, H, W]
+    return volume.permute(0, 2, 1, 3, 4).reshape(B * D, C, H, W)
+
+
+def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=0.5):
+    """
+    Compute loss with slice-wise weighting for 3D volumes
+    
+    Args:
+        pred: [B, C, D=3, H, W] - predicted volume
+        target: [B, C, D=3, H, W] - target volume
+        loss_fn: Loss function that takes (pred, target) and returns scalar
+        mid_weight: Weight for middle slice (0.33=equal, 0.5=mid focused)
+    
+    Returns:
+        Weighted loss scalar
+    
+    NOTE: MSE(노이즈 예측)는 균등하게 유지하고, 
+          image-space 보조 loss에만 mid_weight를 적용하는 것이 권장됨.
+          - prev/next 학습도 z-연속성에 기여
+          - 하지만 최종 출력은 mid 위주이므로 mid에 약간의 가중치 부여가 타당
+    """
+    # Slice weights: [prev, mid, next]
+    side_weight = (1 - mid_weight) / 2
+    slice_weights = [side_weight, mid_weight, side_weight]
+    
+    weighted_loss = 0.0
+    total_weight = sum(slice_weights)
+    
+    for i, w in enumerate(slice_weights):
+        pred_slice = pred[:, :, i, :, :]    # [B, C, H, W]
+        target_slice = target[:, :, i, :, :]
+        slice_loss = loss_fn(pred_slice, target_slice)
+        weighted_loss += w * slice_loss
+    
+    return weighted_loss / total_weight
 
 
 def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, config, metrics_tracker, 
@@ -120,6 +185,9 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     Optimized 3D VAE training with async prefetching and GPU augmentation
     
     Processes 3-slice windows: [B, 1, D=3, H, W]
+    
+    UPDATED (v5.2): LPIPS Loss is now applied to all 3 slices
+    UPDATED (v5.4): LPIPS Loss uses mid_weight for slice weighting
     """
     vae.train()
     total_loss = 0
@@ -167,16 +235,8 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
             # [B, 3, H, W] -> [B, 1, 3, H, W]
             ct_volume = ct_volume.unsqueeze(1)
         
-        # Permute if needed: [B, 1, 3, H, W] is correct for 3D VAE
-        # where 3 is the depth dimension
-        
-        # ============================================================
-        # FIX: GPU Augmentation 조건문 수정
-        # dataset.augment 플래그와 무관하게 gpu_augmenter가 있으면 실행
-        # (main.py에서 GPU aug 사용 시 CPU aug를 끄므로 dataset.augment=False가 됨)
-        # ============================================================
+        # GPU Augmentation
         if gpu_augmenter is not None:
-            # GPU augmentation for 3D data
             ct_volume_2d = ct_volume.squeeze(1)  # [B, 3, H, W] treat depth as channels
             ct_volume_2d, _ = gpu_augmenter(ct_volume_2d, None, epoch=epoch)
             ct_volume = ct_volume_2d.unsqueeze(1)  # [B, 1, 3, H, W]
@@ -204,19 +264,20 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     logger.warning(f"NaN/Inf in logvar at batch {i}")
                     continue
                 
-                # Reconstruction loss with mid-slice weighting
+                # Reconstruction loss with mid-slice weighting (now properly scaled)
                 recon_loss = compute_3d_loss(recon, ct_volume, mid_weight=mid_weight)
                 recon_loss = torch.maximum(recon_loss, torch.tensor(1e-6, device=device))
                 
                 # KL loss
                 kl_loss = kl_loss_fn(mean, logvar)
                 
-                # LPIPS loss (on middle slice for efficiency)
+                # ============================================================
+                # FIX (v5.4): LPIPS loss with mid_weight applied
+                # ============================================================
                 if lpips_loss_fn is not None and lpips_weight > 0 and epoch > 20:
-                    # Extract middle slice: [B, 1, H, W]
-                    recon_mid = recon[:, :, 1, :, :]
-                    target_mid = ct_volume[:, :, 1, :, :]
-                    lpips_loss = lpips_loss_fn(recon_mid, target_mid)
+                    lpips_loss = compute_slicewise_weighted_loss(
+                        recon, ct_volume, lpips_loss_fn, mid_weight=mid_weight
+                    )
                     loss = recon_loss + beta * kl_loss + lpips_weight * lpips_loss
                     lpips_losses.append(lpips_loss.item())
                 else:
@@ -342,9 +403,13 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     
     FIXES APPLIED:
     1. Scale factor 적용 (기본값 0.18215)
-    2. VAE sampling 사용 (mean 대신 sample(mean, logvar))
+    2. Deterministic Encoding - z = mean 사용 (v5.3, 구조 정확도 향상)
     3. Decode 전 rescaling 적용
     4. GPU Augmentation 조건문 수정 (v5.1)
+    5. 모든 3개 슬라이스에 보조 손실 함수(L1, GDL, LPIPS) 적용 (v5.2)
+    6. Image-space 보조 loss에 mid_weight 적용 (v5.4)
+       - MSE(노이즈 예측)는 균등 유지: z-연속성 학습에 기여
+       - Image-space loss에만 mid_weight 적용: 최종 출력 품질 최적화
     """
     diffusion_model.train()
     vae.eval()
@@ -360,16 +425,25 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     
     grad_clip_value = config['training'].get('grad_clip', 0.8)
     
-    # Mid-slice weight for loss
+    # Mid-slice weight for image-space loss (not for MSE)
     mid_weight = config['diffusion'].get('mid_slice_weight', 0.5)
     
-    # ============================================================
-    # FIX 1: Scale Factor 적용
-    # Stable Diffusion 표준값 0.18215 사용
-    # 또는 config에서 지정 가능 (VAE 학습 후 latent std의 역수로 설정 권장)
-    # ============================================================
+    # Scale Factor
     scale_factor = config['model'].get('scale_factor', 0.18215)
-    logger.info(f"Using latent scale factor: {scale_factor}")
+    
+    # Deterministic vs Stochastic Encoding
+    use_stochastic_encoding = config['diffusion'].get('use_stochastic_encoding', False)
+    encoding_type = "stochastic (sample)" if use_stochastic_encoding else "deterministic (mean)"
+    
+    # Log only on first epoch
+    if epoch == 1:
+        logger.info(f"Diffusion training config:")
+        logger.info(f"  - Latent scale factor: {scale_factor}")
+        logger.info(f"  - Encoding type: {encoding_type}")
+        logger.info(f"  - Mid-slice weight (image-space only): {mid_weight}")
+        logger.info(f"  - MSE loss: uniform weighting (for z-continuity)")
+        if not use_stochastic_encoding:
+            logger.info(f"    (Using z=mean for better structural accuracy)")
     
     # MSE threshold for warnings
     high_mse_threshold = 1.2
@@ -408,12 +482,8 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         if ct_volume.dim() == 4:
             ct_volume = ct_volume.unsqueeze(1)
         
-        # ============================================================
-        # FIX: GPU Augmentation 조건문 수정
-        # dataset.augment 플래그와 무관하게 gpu_augmenter가 있으면 실행
-        # ============================================================
+        # GPU Augmentation
         if gpu_augmenter is not None:
-            # Augment (treating depth as channels for 2D augmenter)
             ct_volume_2d = ct_volume.squeeze(1)  # [B, 3, H, W]
             ct_volume_2d, condition = gpu_augmenter(ct_volume_2d, condition, epoch=epoch)
             ct_volume = ct_volume_2d.unsqueeze(1)  # [B, 1, 3, H, W]
@@ -424,24 +494,16 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
             nan_count += 1
             continue
         
-        # ============================================================
-        # FIX 2: VAE Sampling 사용 (mean 대신 sample(mean, logvar))
-        # Deterministic encoding 대신 확률적 sampling으로 변경
-        # ============================================================
+        # Encoding
         with torch.no_grad():
             mean, logvar = vae.encoder(ct_volume)
             
-            # 기존: z = mean (deterministic, 다양성 부족)
-            # 수정: z = sample(mean, logvar) (stochastic, 더 robust한 학습)
-            z = vae.sample(mean, logvar)
+            if use_stochastic_encoding:
+                z = vae.sample(mean, logvar)
+            else:
+                z = mean  # Deterministic for better structural accuracy
             
-            # ============================================================
-            # FIX 1 적용: Scale Factor 곱하기
-            # Latent를 표준 정규 분포에 가깝게 만들어 Diffusion 학습 안정화
-            # ============================================================
             z = z * scale_factor
-            
-            # z shape: [B, z_channels, D=3, h, w]
             
             if torch.isnan(z).any() or torch.isinf(z).any():
                 logger.warning(f"NaN/Inf in VAE encoding at batch {i}, skipping")
@@ -496,8 +558,10 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 else:
                     raise ValueError(f"Unknown prediction type: {diffusion_process.prediction_type}")
                 
-                # MSE loss on the prediction (with mid-slice weighting for 3D)
-                # Treat z as [B, C, D, H, W] -> average over all dims
+                # ============================================================
+                # MSE loss: UNIFORM weighting (not mid_weight)
+                # 이유: prev/next 학습이 z-연속성에 기여하므로 균등하게 유지
+                # ============================================================
                 mse_loss = F.mse_loss(model_output, target)
                 
                 # Warning for high MSE
@@ -526,13 +590,8 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 
                 x0_pred = torch.clamp(x0_pred, -1, 1)
                 
-                # ============================================================
-                # FIX 3: Decode 전 Rescaling 적용
-                # Latent를 원래 스케일로 복원 후 디코딩
-                # ============================================================
+                # Decode
                 x0_pred_rescaled = x0_pred / scale_factor
-                
-                # Decode predicted latent to image space
                 decoded_pred = vae.decode(x0_pred_rescaled)
                 decoded_pred = torch.clamp(decoded_pred, -1, 1)
                 
@@ -542,14 +601,34 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                     optimizer.zero_grad()
                     continue
                 
-                # Perceptual losses on middle slice for efficiency
-                # decoded_pred: [B, 1, D=3, H, W], ct_volume: [B, 1, D=3, H, W]
-                decoded_mid = decoded_pred[:, :, 1, :, :]  # [B, 1, H, W]
-                target_mid = ct_volume[:, :, 1, :, :]  # [B, 1, H, W]
+                # ============================================================
+                # FIX (v5.4): Image-space 보조 loss에 mid_weight 적용
+                # MSE는 균등(z-연속성), image-space는 mid 가중(최종 품질)
+                # ============================================================
                 
-                l1_loss = l1_loss_fn(decoded_mid, target_mid) if l1_weight > 0 else torch.tensor(0.0, device=device)
-                gdl_loss = gdl_loss_fn(decoded_mid, target_mid) if gdl_weight > 0 else torch.tensor(0.0, device=device)
-                lpips_loss = lpips_loss_fn(decoded_mid, target_mid) if lpips_weight > 0 else torch.tensor(0.0, device=device)
+                # L1 Loss with mid_weight
+                if l1_weight > 0:
+                    l1_loss = compute_slicewise_weighted_loss(
+                        decoded_pred, ct_volume, l1_loss_fn, mid_weight=mid_weight
+                    )
+                else:
+                    l1_loss = torch.tensor(0.0, device=device)
+                
+                # GDL Loss with mid_weight
+                if gdl_weight > 0:
+                    gdl_loss = compute_slicewise_weighted_loss(
+                        decoded_pred, ct_volume, gdl_loss_fn, mid_weight=mid_weight
+                    )
+                else:
+                    gdl_loss = torch.tensor(0.0, device=device)
+                
+                # LPIPS Loss with mid_weight
+                if lpips_weight > 0:
+                    lpips_loss = compute_slicewise_weighted_loss(
+                        decoded_pred, ct_volume, lpips_loss_fn, mid_weight=mid_weight
+                    )
+                else:
+                    lpips_loss = torch.tensor(0.0, device=device)
                 
                 loss = mse_loss + l1_weight * l1_loss + gdl_weight * gdl_loss + lpips_weight * lpips_loss
                 
@@ -682,11 +761,13 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                             gdl_loss=avg_gdl,
                             lpips_loss=avg_lpips,
                             pred_type=diffusion_process.prediction_type,
+                            encoding_type=encoding_type,
+                            mid_weight=mid_weight,
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
                             nan_count=nan_count,
                             high_loss_count=high_loss_count,
-                            scale_factor=scale_factor)  # Log scale factor
+                            scale_factor=scale_factor)
     
     return avg_loss
 

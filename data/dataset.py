@@ -3,7 +3,11 @@ Dataset and data loading utilities for 3D Slab-based generation
 Loads 3-slice CT windows: [B, 1, D=3, H, W]
 
 FIXES APPLIED:
-1. 이중 정규화 방지 - 통계 기반 정규화 제거, 단순 [0,1] -> [-1,1] 스케일링만 수행
+1. 이중 정규화 문제 완전 수정 (v5.7)
+   - normalize_volumes=True: [0,1] -> [-1,1] 변환 수행
+   - normalize_volumes=False: 변환 없음 (데이터가 이미 [-1,1]이라고 가정)
+   - 하단의 중복 정규화 블록 완전 제거
+2. 디버그용 min/max 로깅 추가 (선택적)
 """
 
 import torch
@@ -25,10 +29,30 @@ class OptimizedDentalSliceDataset(Dataset):
         ct_volume: [1, D=3, H, W] - 3-slice CT window (prev, mid, next)
         condition: [3, H, W] or [1, 3, H, W] - 3-channel panorama condition
         slice_position: float in [0, 1] - normalized position of middle slice
+    
+    Normalization Policy (v5.7):
+        - normalize_volumes=True: 데이터가 [0, 1] 범위라고 가정하고 [-1, 1]로 변환
+        - normalize_volumes=False: 데이터가 이미 [-1, 1] 범위라고 가정하고 변환 없음
     """
     def __init__(self, root_dir, folders, slice_range=(0, 120), augment=True, 
                  panorama_type='axial', normalize_volumes=True, augment_config=None,
-                 pano_triplet=True, cache_volumes=True, use_memmap=True):
+                 pano_triplet=True, cache_volumes=True, use_memmap=True,
+                 debug_normalization=False):
+        """
+        Args:
+            root_dir: Root directory containing data folders
+            folders: List of folder names to use
+            slice_range: (start, end) slice indices
+            augment: Whether to apply CPU augmentation
+            panorama_type: Type of panorama extraction ('axial', 'coronal', 'mip', 'curved')
+            normalize_volumes: If True, apply [0,1] -> [-1,1] scaling
+                              If False, assume data is already in [-1,1] range
+            augment_config: Configuration for data augmentation
+            pano_triplet: Always True for 3D slab
+            cache_volumes: Whether to cache volumes in memory
+            use_memmap: Whether to use memory-mapped files
+            debug_normalization: If True, log min/max values for debugging
+        """
         self.root_dir = root_dir
         self.folders = folders
         self.slice_range = slice_range
@@ -41,6 +65,7 @@ class OptimizedDentalSliceDataset(Dataset):
         self.pano_triplet = pano_triplet  # Always True for 3D slab
         self.cache_volumes = cache_volumes
         self.use_memmap = use_memmap
+        self.debug_normalization = debug_normalization
         
         # Volume cache using memory mapping
         self._volume_cache = {}
@@ -57,7 +82,7 @@ class OptimizedDentalSliceDataset(Dataset):
         self.slices_per_volume = slice_range[1] - slice_range[0]
         self.total_slices = len(folders) * self.slices_per_volume
         
-        # Cache for volume statistics (for normalization) - DEPRECATED but kept for compatibility
+        # Cache for volume statistics (DEPRECATED - kept for compatibility only)
         self.volume_stats = {}
         
         # Windows multiprocessing compatibility
@@ -66,10 +91,21 @@ class OptimizedDentalSliceDataset(Dataset):
         else:
             self.persistent_cache = True
         
-        # Log normalization mode
+        # Log normalization policy clearly
         if normalize_volumes:
-            logger.warning("normalize_volumes=True is DEPRECATED. "
-                          "Using simple [0,1] -> [-1,1] scaling instead of instance normalization.")
+            logger.info("="*60)
+            logger.info("NORMALIZATION POLICY: normalize_volumes=True")
+            logger.info("  - Input data expected range: [0, 1]")
+            logger.info("  - Output data range: [-1, 1]")
+            logger.info("  - Transformation: x' = x * 2 - 1")
+            logger.info("="*60)
+        else:
+            logger.info("="*60)
+            logger.info("NORMALIZATION POLICY: normalize_volumes=False")
+            logger.info("  - Input data expected range: [-1, 1]")
+            logger.info("  - Output data range: [-1, 1] (no transformation)")
+            logger.info("  - Transformation: None (passthrough)")
+            logger.info("="*60)
     
     def _get_volume_memmap(self, path):
         """Get memory-mapped volume for efficient access"""
@@ -209,24 +245,38 @@ class OptimizedDentalSliceDataset(Dataset):
     
     def normalize_slice(self, slice_data, folder):
         """
-        Normalize slice - FIXED: Simple [0,1] -> [-1,1] scaling only
+        Normalize slice from [0, 1] to [-1, 1]
         
-        이전 방식 (제거됨): 통계 기반 정규화 (Instance Norm)
-        새 방식: 데이터가 이미 [0, 1] 범위라고 가정하고 [-1, 1]로 매핑만 수행
+        This function is ONLY called when normalize_volumes=True.
+        Assumes input data is in [0, 1] range.
+        
+        Args:
+            slice_data: numpy array in [0, 1] range
+            folder: folder name (unused, kept for compatibility)
+        
+        Returns:
+            numpy array in [-1, 1] range
         """
-        # [수정]: 통계 기반 정규화 제거, 단순 스케일링만 수행
+        # Transform: [0, 1] -> [-1, 1]
         slice_data = (slice_data * 2.0) - 1.0
         slice_data = np.clip(slice_data, -1.0, 1.0)
         return slice_data
     
     def normalize_volume(self, volume, folder):
         """
-        Normalize volume - FIXED: Simple [0,1] -> [-1,1] scaling only
+        Normalize volume from [0, 1] to [-1, 1]
         
-        이전 방식 (제거됨): 통계 기반 정규화 (Instance Norm) - 환자 간 밀도 차이 정보 파괴
-        새 방식: 데이터가 이미 [0, 1] 범위라고 가정하고 [-1, 1]로 매핑만 수행
+        This function is ONLY called when normalize_volumes=True.
+        Assumes input data is in [0, 1] range.
+        
+        Args:
+            volume: numpy array in [0, 1] range
+            folder: folder name (unused, kept for compatibility)
+        
+        Returns:
+            numpy array in [-1, 1] range
         """
-        # [수정]: 통계 기반 정규화 제거, 단순 스케일링만 수행
+        # Transform: [0, 1] -> [-1, 1]
         volume = (volume * 2.0) - 1.0
         volume = np.clip(volume, -1.0, 1.0)
         return volume
@@ -312,7 +362,7 @@ class OptimizedDentalSliceDataset(Dataset):
                     pano_volume = self._get_volume_cached(pano_path, folder + '_pano')
                     if pano_volume is not None:
                         pano_2d = self.extract_panorama(pano_volume, pano_volume, idx)
-                        # [수정]: 단순 스케일링 적용
+                        # Apply normalization only if normalize_volumes=True
                         if self.normalize_volumes:
                             pano_2d = self.normalize_slice(pano_2d, folder + '_pano')
                     else:
@@ -326,7 +376,7 @@ class OptimizedDentalSliceDataset(Dataset):
                     ct_volume = self._get_volume_cached(ct_path, folder)
                     if ct_volume is not None:
                         pano_2d = self.extract_panorama(ct_volume, ct_volume, idx)
-                        # [수정]: 단순 스케일링 적용
+                        # Apply normalization only if normalize_volumes=True
                         if self.normalize_volumes:
                             pano_2d = self.normalize_slice(pano_2d, folder)
                     else:
@@ -343,7 +393,7 @@ class OptimizedDentalSliceDataset(Dataset):
         """Internal function with retry logic - returns 3D slab data"""
         if retry_count >= self.max_retry_count:
             logger.error(f"Max retry count exceeded for index {idx}")
-            # Return dummy 3D data
+            # Return dummy 3D data (already in [-1, 1] range)
             dummy_ct = np.zeros((3, 200, 200), dtype=np.float32)
             dummy_pano = np.zeros((3, 200, 200), dtype=np.float32)
             
@@ -372,11 +422,16 @@ class OptimizedDentalSliceDataset(Dataset):
             logger.error(f"Failed to load CT window: {ct_path}, slice {slice_idx}")
             return self._get_item_with_retry((idx + 1) % len(self), retry_count + 1)
         
-        # [수정]: 단순 스케일링만 적용 - 통계 기반 정규화 제거
+        # Debug: log raw data range before normalization
+        if self.debug_normalization and idx % 1000 == 0:
+            logger.info(f"[DEBUG] Raw CT data range (before norm): [{ct_window.min():.4f}, {ct_window.max():.4f}]")
+        
+        # Apply normalization ONLY if normalize_volumes=True
+        # This is the ONLY place where normalization happens
         if self.normalize_volumes:
             ct_window = self.normalize_volume(ct_window, folder)
         
-        # Get 3-slice panorama condition
+        # Get 3-slice panorama condition (normalization is handled inside _get_pano_3window)
         pano_window = self._get_pano_3window(volume_idx, slice_idx)
         
         # Apply augmentation (same transform to all 3 slices)
@@ -393,16 +448,26 @@ class OptimizedDentalSliceDataset(Dataset):
         # Panorama: [3, H, W] stays as is for condition
         pano_tensor = torch.from_numpy(pano_window.copy()).float()  # [3, H, W]
         
-        # [수정]: normalize_volumes 플래그와 상관없이 이미 [-1, 1] 범위로 변환됨
-        # 추가 스케일링 불필요 - 이미 normalize_volume/normalize_slice에서 처리됨
-        if not self.normalize_volumes:
-            # normalize_volumes=False인 경우에만 추가 스케일링
-            # 데이터가 [0, 1] 범위라고 가정
-            pano_tensor = (pano_tensor * 2.0) - 1.0
-            ct_tensor = (ct_tensor * 2.0) - 1.0
+        # ============================================================
+        # [FIX v5.7]: 이중 정규화 블록 완전 제거
+        # ============================================================
+        # 기존 코드 (제거됨):
+        # if not self.normalize_volumes:
+        #     pano_tensor = (pano_tensor * 2.0) - 1.0
+        #     ct_tensor = (ct_tensor * 2.0) - 1.0
+        #
+        # 이제 정규화는 오직 normalize_volume() / normalize_slice() 에서만 수행됨
+        # normalize_volumes=False 이면 데이터가 이미 [-1, 1]이라고 가정하고 변환 없음
+        # ============================================================
         
+        # Safety clamp (always apply as safeguard)
         pano_tensor = torch.clamp(pano_tensor, -1.0, 1.0)
         ct_tensor = torch.clamp(ct_tensor, -1.0, 1.0)
+        
+        # Debug: log final data range after all processing
+        if self.debug_normalization and idx % 1000 == 0:
+            logger.info(f"[DEBUG] Final CT tensor range: [{ct_tensor.min():.4f}, {ct_tensor.max():.4f}]")
+            logger.info(f"[DEBUG] Final Pano tensor range: [{pano_tensor.min():.4f}, {pano_tensor.max():.4f}]")
         
         # Check for NaN
         if torch.isnan(pano_tensor).any() or torch.isnan(ct_tensor).any():

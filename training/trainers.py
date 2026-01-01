@@ -11,6 +11,7 @@ FIXES APPLIED:
 6. compute_3d_loss 스케일 오류 수정 - 분모에 C 포함 (v5.4)
 7. Image-space 보조 loss에 mid_weight 적용 (MSE는 균등 유지) (v5.4)
 8. [신규] VAE 학습에 GDL 추가 및 균등 가중치(Equal Weight) 적용 (v5.5)
+9. [신규] VAE Autocast 조건 수정 - use_amp 파라미터 기반으로 변경 (v5.6)
 """
 
 import torch
@@ -181,7 +182,8 @@ def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=None):
 
 def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, config, metrics_tracker, 
               lpips_loss_fn=None, lpips_weight=0.1, scaler=None, accumulation_steps=1,
-              gpu_augmenter=None, gdl_loss_fn=None, gdl_weight=0.0):
+              gpu_augmenter=None, gdl_loss_fn=None, gdl_weight=0.0,
+              use_amp=False, autocast_dtype=torch.float16):
     """
     Optimized 3D VAE training with async prefetching and GPU augmentation
     
@@ -191,10 +193,13 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     1. [수정 v5.2]: LPIPS Loss is now applied to all 3 slices
     2. [수정 v5.5]: VAE 학습 시 균등 가중치(Equal Weight) 사용 - mid_weight=None
     3. [수정 v5.5]: GDL(Gradient Difference Loss) 추가
+    4. [수정 v5.6]: Autocast 조건을 use_amp 파라미터 기반으로 변경 (BF16 지원)
     
     Args:
         gdl_loss_fn: GradientDifferenceLoss 인스턴스 (None이면 비활성화)
         gdl_weight: GDL loss 가중치 (0이면 비활성화)
+        use_amp: AMP 사용 여부 (BF16 또는 FP16)
+        autocast_dtype: Autocast dtype (torch.bfloat16 or torch.float16)
     """
     vae.train()
     total_loss = 0
@@ -220,6 +225,9 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
         logger.info(f"  - Actual mid_weight: Equal (1/3 for all slices)")
         logger.info(f"  - GDL weight: {gdl_weight}")
         logger.info(f"  - LPIPS weight: {lpips_weight}")
+        logger.info(f"  - AMP enabled: {use_amp}")
+        logger.info(f"  - Autocast dtype: {autocast_dtype}")
+        logger.info(f"  - GradScaler enabled: {scaler is not None}")
     
     optimizer.zero_grad()
     
@@ -267,7 +275,8 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
         grad_norm = torch.tensor(0.0)
         
         try:
-            with torch.amp.autocast(device_type='cuda', enabled=scaler is not None):
+            # [수정 v5.6]: use_amp 파라미터 기반으로 autocast 활성화
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp, dtype=autocast_dtype):
                 # Forward pass through 3D VAE
                 recon, mean, logvar = vae(ct_volume)
                 
@@ -419,7 +428,9 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
                             skipped_steps=skipped_steps,
-                            mid_weight='equal')  # [추가] 균등 가중치 사용 로깅
+                            mid_weight='equal',  # [추가] 균등 가중치 사용 로깅
+                            use_amp=use_amp,
+                            autocast_dtype=str(autocast_dtype))
     
     return avg_loss, avg_recon, avg_kl
 

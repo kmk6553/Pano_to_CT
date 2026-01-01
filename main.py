@@ -86,7 +86,7 @@ def compute_latent_scale_factor(vae, dataloader, device, num_samples=100):
                 ct_volume = ct_volume.unsqueeze(1)
             
             mean, logvar = vae.encoder(ct_volume)
-            z = vae.sample(mean, logvar)
+            z = mean
             latents.append(z.cpu())
     
     all_latents = torch.cat(latents, dim=0)

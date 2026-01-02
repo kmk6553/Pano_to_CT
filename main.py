@@ -12,6 +12,9 @@ FIXES APPLIED:
 4. normalize_volumes 옵션 경고 메시지 추가
 5. [v5.7] evaluate_and_visualize 호출 시 scale_factor 전달 (버그 수정)
 6. [v5.7] 정규화 정책 경고 메시지 개선
+7. [v5.9] Warmup steps config 우선 사용
+8. [v5.9] Self-conditioning 플래그 수정 (끌 수 있도록)
+9. [v5.9] 데이터 폴더 스캔 방식 개선 (실제 폴더 확인)
 """
 
 import torch
@@ -103,6 +106,53 @@ def compute_latent_scale_factor(vae, dataloader, device, num_samples=100):
     logger.info(f"  Scale factor (1/std): {scale_factor:.4f}")
     
     return scale_factor
+
+
+def scan_data_folders(data_dir, max_folders=500):
+    """
+    [FIX v5.9] 실제 존재하는 데이터 폴더만 스캔
+    
+    Args:
+        data_dir: 데이터 디렉토리 경로
+        max_folders: 최대 폴더 수
+    
+    Returns:
+        유효한 폴더명 리스트
+    """
+    if not os.path.exists(data_dir):
+        logger.error(f"Data directory not found: {data_dir}")
+        return []
+    
+    # 실제 존재하는 폴더 스캔
+    all_entries = os.listdir(data_dir)
+    valid_folders = []
+    
+    for entry in sorted(all_entries):
+        entry_path = os.path.join(data_dir, entry)
+        if os.path.isdir(entry_path):
+            # CT 폴더가 있는지 확인 (유효한 데이터 폴더인지 검증)
+            ct_path = os.path.join(entry_path, 'CT')
+            if os.path.exists(ct_path):
+                valid_folders.append(entry)
+            else:
+                # CT 폴더 없어도 일단 포함 (다른 구조일 수 있음)
+                valid_folders.append(entry)
+    
+    # 최대 폴더 수 제한
+    valid_folders = valid_folders[:max_folders]
+    
+    logger.info(f"Scanned data directory: {data_dir}")
+    logger.info(f"Found {len(valid_folders)} valid folders (max: {max_folders})")
+    
+    if len(valid_folders) == 0:
+        logger.warning("No valid data folders found! Check your data directory structure.")
+    elif len(valid_folders) < 10:
+        logger.info(f"Folders found: {valid_folders}")
+    else:
+        logger.info(f"First 5 folders: {valid_folders[:5]}")
+        logger.info(f"Last 5 folders: {valid_folders[-5:]}")
+    
+    return valid_folders
 
 
 def main(args):
@@ -361,9 +411,17 @@ def main(args):
     # Save configuration
     save_config(config, save_dir)
     
-    # Prepare data
+    # ============================================================
+    # [FIX v5.9] 데이터 폴더 스캔 방식 개선
+    # 기존: 하드코딩된 폴더명 생성 (실제 폴더 확인 안 함)
+    # 수정: 실제 존재하는 폴더만 스캔
+    # ============================================================
     max_folders = config.get('max_data_folders', 500)
-    all_folders = [f'{i:04d}' for i in range(0, min(max_folders, 500))]
+    all_folders = scan_data_folders(config['data']['data_dir'], max_folders)
+    
+    if len(all_folders) == 0:
+        logger.error("No data folders found! Exiting.")
+        return
     
     np.random.seed(config['seed'])
     random.seed(config['seed'])
@@ -588,7 +646,11 @@ def main(args):
             diffusion_start_epoch = diffusion_checkpoint['epoch'] + 1
             logger.info(f"Resuming diffusion training from epoch {diffusion_start_epoch}")
     
-    # Setup diffusion scheduler with warmup
+    # ============================================================
+    # [FIX v5.9] Warmup steps - config 값 우선 사용
+    # 기존: min(5000, total_steps // 10) 하드코딩
+    # 수정: config['training']['warmup_steps'] 우선 사용
+    # ============================================================
     steps_per_epoch = len(train_loader) // accumulation_steps
     total_steps = config['training']['diffusion_epochs'] * steps_per_epoch
     
@@ -596,7 +658,14 @@ def main(args):
         warmup_steps = 0
         completed_steps = (diffusion_start_epoch - 1) * steps_per_epoch
     else:
-        warmup_steps = min(5000, total_steps // 10)
+        # Config 값 우선 사용, 없으면 기본값 계산
+        config_warmup = config['training'].get('warmup_steps', None)
+        if config_warmup is not None:
+            warmup_steps = min(config_warmup, total_steps // 2)
+            logger.info(f"Using config warmup_steps: {config_warmup} -> {warmup_steps} (capped at total_steps/2)")
+        else:
+            warmup_steps = min(5000, total_steps // 10)
+            logger.info(f"Using default warmup_steps: {warmup_steps}")
         completed_steps = 0
     
     diffusion_scheduler = WarmupCosineScheduler(
@@ -752,6 +821,7 @@ def main(args):
     logger.info(f"Guidance scale: {config['diffusion']['guidance_scale']}")
     logger.info(f"Mid-slice weight (image-space): {config['diffusion']['mid_slice_weight']}")
     logger.info(f"Latent scale factor: {config['model']['scale_factor']}")
+    logger.info(f"Warmup steps: {warmup_steps}")
     logger.info(f"Total epochs: {config['training']['diffusion_epochs']}")
     if diffusion_start_epoch > 1:
         logger.info(f"Resuming from epoch: {diffusion_start_epoch}")
@@ -952,8 +1022,17 @@ if __name__ == '__main__':
     parser.add_argument('--prediction_type', type=str, default='v', 
                        choices=['v', 'epsilon', 'x0'],
                        help='Diffusion prediction type')
-    parser.add_argument('--use_self_conditioning', action='store_true', default=True,
-                       help='Enable self-conditioning')
+    
+    # ============================================================
+    # [FIX v5.9] Self-conditioning 플래그 수정
+    # 기존: action='store_true', default=True (끌 수 없음)
+    # 수정: default=False로 변경하고, 명시적으로 켜야 함
+    # ============================================================
+    parser.add_argument('--use_self_conditioning', action='store_true', default=False,
+                       help='Enable self-conditioning (default: False, add flag to enable)')
+    parser.add_argument('--no_self_conditioning', action='store_true', default=False,
+                       help='Explicitly disable self-conditioning (for clarity)')
+    
     parser.add_argument('--self_cond_prob', type=float, default=0.5,
                        help='Self-conditioning probability')
     parser.add_argument('--cfg_dropout_prob', type=float, default=0.1,
@@ -983,7 +1062,8 @@ if __name__ == '__main__':
     parser.add_argument('--diffusion_lr', type=float, default=0.00005)
     parser.add_argument('--consistency_lr', type=float, default=0.0001)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--warmup_steps', type=int, default=5000)
+    parser.add_argument('--warmup_steps', type=int, default=5000,
+                       help='Number of warmup steps for diffusion training')
     parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2,
                        help='Gradient accumulation (increased default for 3D)')
@@ -1025,4 +1105,12 @@ if __name__ == '__main__':
                         'Default is deterministic for better structural accuracy.')
     
     args = parser.parse_args()
+    
+    # ============================================================
+    # [FIX v5.9] Self-conditioning 플래그 처리
+    # --no_self_conditioning이 명시되면 강제로 끔
+    # ============================================================
+    if args.no_self_conditioning:
+        args.use_self_conditioning = False
+    
     main(args)

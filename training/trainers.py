@@ -13,6 +13,7 @@ FIXES APPLIED:
 8. [신규] VAE 학습에 GDL 추가 및 균등 가중치(Equal Weight) 적용 (v5.5)
 9. [신규] VAE Autocast 조건 수정 - use_amp 파라미터 기반으로 변경 (v5.6)
 10. [FIX v5.8] CFG Dropout을 샘플별 독립 마스크로 변경 (배치 전체 일괄 적용 문제 수정)
+11. [FIX v5.9] x0_pred Latent Clamp 범위 확장: [-1, 1] -> [-3, 3] (고주파 정보 손실 방지)
 """
 
 import torch
@@ -458,6 +459,9 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     7. [FIX v5.8] CFG Dropout을 샘플별 독립 마스크로 변경
        - 기존: 배치 전체에 일괄 적용 (np.random.rand() < prob)
        - 수정: 각 샘플별로 독립적인 dropout 마스크 생성
+    8. [FIX v5.9] x0_pred Latent Clamp 범위 확장: [-1, 1] -> [-3, 3]
+       - 기존: torch.clamp(x0_pred, -1, 1) - 고주파 정보 손실
+       - 수정: torch.clamp(x0_pred, -3, 3) - VAE latent 분포 보존
     """
     diffusion_model.train()
     vae.eval()
@@ -479,6 +483,12 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     # Scale Factor
     scale_factor = config['model'].get('scale_factor', 0.18215)
     
+    # ============================================================
+    # [FIX v5.9] Latent Clamp 범위 설정
+    # diffusion_process와 동일한 값 사용
+    # ============================================================
+    latent_clamp_range = getattr(diffusion_process, 'latent_clamp_range', 3.0)
+    
     # Deterministic vs Stochastic Encoding
     use_stochastic_encoding = config['diffusion'].get('use_stochastic_encoding', False)
     encoding_type = "stochastic (sample)" if use_stochastic_encoding else "deterministic (mean)"
@@ -487,10 +497,12 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     if epoch == 1:
         logger.info(f"Diffusion training config:")
         logger.info(f"  - Latent scale factor: {scale_factor}")
+        logger.info(f"  - Latent clamp range: [-{latent_clamp_range}, {latent_clamp_range}]")
         logger.info(f"  - Encoding type: {encoding_type}")
         logger.info(f"  - Mid-slice weight (image-space only): {mid_weight}")
         logger.info(f"  - MSE loss: uniform weighting (for z-continuity)")
         logger.info(f"  - [FIX v5.8] CFG Dropout: Per-sample independent masking")
+        logger.info(f"  - [FIX v5.9] x0_pred clamp: [-{latent_clamp_range}, {latent_clamp_range}]")
         if not use_stochastic_encoding:
             logger.info(f"    (Using z=mean for better structural accuracy)")
     
@@ -638,7 +650,12 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 else:
                     x0_pred = model_output
                 
-                x0_pred = torch.clamp(x0_pred, -1, 1)
+                # ============================================================
+                # [FIX v5.9] Latent Clamp 범위 확장: [-1, 1] -> [-3, 3]
+                # 기존: torch.clamp(x0_pred, -1, 1) - 고주파 정보 약 70% 손실
+                # 수정: torch.clamp(x0_pred, -3, 3) - VAE latent N(0,1) 분포 보존
+                # ============================================================
+                x0_pred = torch.clamp(x0_pred, -latent_clamp_range, latent_clamp_range)
                 
                 # Decode
                 x0_pred_rescaled = x0_pred / scale_factor
@@ -810,6 +827,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                             pred_type=diffusion_process.prediction_type,
                             encoding_type=encoding_type,
                             mid_weight=mid_weight,
+                            latent_clamp_range=latent_clamp_range,
                             cfg_dropout='per_sample',  # [FIX v5.8] 로깅
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,

@@ -4,6 +4,7 @@ Data augmentation utilities for both CPU and GPU
 FIXES APPLIED:
 1. GT CT(Target)에는 Intensity Augmentation 적용 금지
 2. Geometric 변환은 유지하되, 밝기/노이즈 변환은 Condition(Pano)에만 적용
+3. [FIX v5.8] Kornia 미설치 시 Import 에러 수정 - 클래스 정의를 조건문 안으로 이동
 """
 
 import torch
@@ -12,16 +13,21 @@ import numpy as np
 from scipy.ndimage import rotate, map_coordinates, gaussian_filter
 import logging
 
-# Try to import Kornia for GPU augmentation
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# [FIX v5.8] Kornia Import 방어 코드 개선
+# 기존: K가 정의되지 않은 상태에서 상속 시도하여 NameError 발생
+# 수정: 클래스 정의 전체를 if KORNIA_AVAILABLE 블록 안으로 이동
+# ============================================================
 try:
     import kornia
     import kornia.augmentation as K
     KORNIA_AVAILABLE = True
 except ImportError:
     KORNIA_AVAILABLE = False
-    print("Warning: Kornia not installed. GPU augmentation disabled. Install with: pip install kornia")
-
-logger = logging.getLogger(__name__)
+    K = None  # Placeholder
+    logger.warning("Kornia not installed. GPU augmentation disabled. Install with: pip install kornia")
 
 
 class ElasticTransform:
@@ -81,7 +87,12 @@ class ElasticTransform:
 
 
 class DataAugmentation:
-    """Advanced data augmentation for medical images"""
+    """
+    Advanced data augmentation for medical images (CPU-based)
+    
+    [FIX v5.8] 3-slice window에 동일한 augmentation 파라미터 적용을 위한
+               apply_consistent() 메서드 추가
+    """
     def __init__(self, config):
         self.config = config
         self.use_elastic = config.get('use_elastic', True)
@@ -94,54 +105,87 @@ class DataAugmentation:
                 alpha_affine=config.get('elastic_alpha_affine', 10)
             )
     
-    def random_flip(self, image, pano):
-        """Random horizontal flip"""
-        if np.random.rand() > 0.5:
+    def random_flip(self, image, pano, do_flip=None):
+        """Random horizontal flip with optional fixed parameter"""
+        if do_flip is None:
+            do_flip = np.random.rand() > 0.5
+        
+        if do_flip:
             image = np.flip(image, axis=1).copy()
             pano = np.flip(pano, axis=1).copy()
         return image, pano
     
-    def random_rotation(self, image, pano):
-        """Random rotation"""
-        if np.random.rand() > 0.8:
-            angle = np.random.uniform(-10, 10)
+    def random_rotation(self, image, pano, angle=None, do_rotate=None):
+        """Random rotation with optional fixed parameters"""
+        if do_rotate is None:
+            do_rotate = np.random.rand() > 0.8
+        
+        if do_rotate:
+            if angle is None:
+                angle = np.random.uniform(-10, 10)
             image = rotate(image, angle, reshape=False, order=1, mode='constant', cval=image.min())
             pano = rotate(pano, angle, reshape=False, order=1, mode='constant', cval=pano.min())
         return image, pano
     
-    def elastic_deformation(self, image, pano, epoch=None):
+    def elastic_deformation(self, image, pano, epoch=None, do_elastic=None, random_state=None):
         """Apply elastic deformation with reduced intensity"""
         # Disable elastic deformation in early epochs
         if epoch is not None and epoch < self.augment_from_epoch:
             return image, pano
+        
+        if do_elastic is None:
+            do_elastic = np.random.rand() > 0.9
             
-        if self.use_elastic and np.random.rand() > 0.9:
-            image = self.elastic(image)
-            pano = self.elastic(pano)
+        if self.use_elastic and do_elastic:
+            # Use consistent random state if provided
+            if random_state is not None:
+                elastic = ElasticTransform(
+                    alpha=self.config.get('elastic_alpha', 10),
+                    sigma=self.config.get('elastic_sigma', 4),
+                    alpha_affine=self.config.get('elastic_alpha_affine', 10),
+                    random_state=random_state
+                )
+                image = elastic(image)
+                pano = elastic(pano)
+            else:
+                image = self.elastic(image)
+                pano = self.elastic(pano)
         return image, pano
     
-    def gamma_correction(self, image):
+    def gamma_correction(self, image, gamma=None):
         """Random gamma correction - [수정]: Pano에만 적용"""
-        if np.random.rand() > 0.8:
-            gamma = np.random.uniform(0.9, 1.1)
-            img_min, img_max = image.min(), image.max()
-            if img_max > img_min:
-                image_norm = (image - img_min) / (img_max - img_min)
-                image_gamma = np.power(image_norm, gamma)
-                image = image_gamma * (img_max - img_min) + img_min
+        if gamma is None:
+            if np.random.rand() > 0.8:
+                gamma = np.random.uniform(0.9, 1.1)
+            else:
+                return image
+        
+        img_min, img_max = image.min(), image.max()
+        if img_max > img_min:
+            image_norm = (image - img_min) / (img_max - img_min)
+            image_gamma = np.power(image_norm, gamma)
+            image = image_gamma * (img_max - img_min) + img_min
         return image
     
-    def random_noise(self, image):
+    def random_noise(self, image, noise_std=None):
         """Add random Gaussian noise - [수정]: Pano에만 적용"""
-        if np.random.rand() > 0.9:
-            noise_std = np.random.uniform(0.005, 0.02)
-            noise = np.random.normal(0, noise_std, image.shape)
-            image = image + noise
+        if noise_std is None:
+            if np.random.rand() > 0.9:
+                noise_std = np.random.uniform(0.005, 0.02)
+            else:
+                return image
+        
+        noise = np.random.normal(0, noise_std, image.shape)
+        image = image + noise
         return image
     
     def apply(self, image, pano, epoch=None):
         """
-        Apply all augmentations
+        Apply all augmentations (legacy method for backward compatibility)
+        
+        WARNING: 이 메서드는 각 호출마다 다른 랜덤 파라미터를 사용합니다.
+                 3-slice window에 일관된 augmentation을 적용하려면
+                 apply_consistent() 또는 sample_params() + apply_with_params()를 사용하세요.
         
         [수정]: Intensity augmentation (gamma, noise)는 Pano에만 적용
         Target CT는 기하학적 변환만 유지
@@ -152,50 +196,117 @@ class DataAugmentation:
         image, pano = self.elastic_deformation(image, pano, epoch)
         
         # [수정]: Intensity augmentations - Pano에만 적용, Target CT는 제외
-        # image = self.gamma_correction(image)  # 제거
-        # image = self.random_noise(image)  # 제거
-        pano = self.gamma_correction(pano)  # Pano에만 적용
-        pano = self.random_noise(pano)  # Pano에만 적용
+        pano = self.gamma_correction(pano)
+        pano = self.random_noise(pano)
+        
+        return image, pano
+    
+    def sample_params(self, epoch=None):
+        """
+        [FIX v5.8] 3-slice window에 일관된 augmentation을 위한 파라미터 샘플링
+        
+        Returns:
+            dict: augmentation 파라미터들
+        """
+        params = {
+            'do_flip': np.random.rand() > 0.5,
+            'do_rotate': np.random.rand() > 0.8,
+            'rotation_angle': np.random.uniform(-10, 10),
+            'do_elastic': np.random.rand() > 0.9 if (epoch is None or epoch >= self.augment_from_epoch) else False,
+            'elastic_seed': np.random.randint(0, 2**31),
+            'do_gamma': np.random.rand() > 0.8,
+            'gamma_value': np.random.uniform(0.9, 1.1),
+            'do_noise': np.random.rand() > 0.9,
+            'noise_std': np.random.uniform(0.005, 0.02)
+        }
+        return params
+    
+    def apply_with_params(self, image, pano, params, epoch=None):
+        """
+        [FIX v5.8] 미리 샘플링된 파라미터로 augmentation 적용
+        
+        Args:
+            image: CT slice
+            pano: Panorama slice
+            params: sample_params()에서 반환된 파라미터 dict
+            epoch: 현재 epoch (elastic deformation 조건용)
+        
+        Returns:
+            augmented (image, pano) tuple
+        """
+        # Geometric augmentations (apply to both)
+        image, pano = self.random_flip(image, pano, do_flip=params['do_flip'])
+        image, pano = self.random_rotation(image, pano, 
+                                           angle=params['rotation_angle'],
+                                           do_rotate=params['do_rotate'])
+        
+        if params['do_elastic']:
+            random_state = np.random.RandomState(params['elastic_seed'])
+            image, pano = self.elastic_deformation(image, pano, epoch=epoch,
+                                                   do_elastic=True,
+                                                   random_state=random_state)
+        
+        # Intensity augmentations - Pano에만 적용
+        if params['do_gamma']:
+            pano = self.gamma_correction(pano, gamma=params['gamma_value'])
+        
+        if params['do_noise']:
+            pano = self.random_noise(pano, noise_std=params['noise_std'])
         
         return image, pano
 
 
-# ==================== Safe GPU Augmentation Components ====================
+# ============================================================
+# [FIX v5.8] GPU Augmentation Components - Kornia 조건부 정의
+# 기존: try-except 후 클래스 정의가 전역에 있어 NameError 발생
+# 수정: KORNIA_AVAILABLE 조건 안에서만 클래스 정의
+# ============================================================
 
-class SafeRandomGamma(K.RandomGamma):
-    """Safe RandomGamma that handles negative values in [-1, 1] range"""
-    def apply_transform(self, input: torch.Tensor, params, flags, transform=None):
-        # Convert from [-1, 1] to [0, 1] for gamma correction
-        input_shifted = (input + 1.0) * 0.5
-        
-        # Apply gamma correction
-        output_shifted = super().apply_transform(input_shifted, params, flags, transform)
-        
-        # Convert back to [-1, 1]
-        output = output_shifted * 2.0 - 1.0
-        
-        return output
+if KORNIA_AVAILABLE:
+    class SafeRandomGamma(K.RandomGamma):
+        """Safe RandomGamma that handles negative values in [-1, 1] range"""
+        def apply_transform(self, input: torch.Tensor, params, flags, transform=None):
+            # Convert from [-1, 1] to [0, 1] for gamma correction
+            input_shifted = (input + 1.0) * 0.5
+            
+            # Apply gamma correction
+            output_shifted = super().apply_transform(input_shifted, params, flags, transform)
+            
+            # Convert back to [-1, 1]
+            output = output_shifted * 2.0 - 1.0
+            
+            return output
 
 
-class StableElasticTransform(K.RandomElasticTransform):
-    """Stable elastic transform with safety constraints"""
-    def __init__(self, *args, **kwargs):
-        # Override default parameters for stability
-        kwargs['align_corners'] = kwargs.get('align_corners', True)
-        kwargs['padding_mode'] = kwargs.get('padding_mode', 'reflection')
-        super().__init__(*args, **kwargs)
+    class StableElasticTransform(K.RandomElasticTransform):
+        """Stable elastic transform with safety constraints"""
+        def __init__(self, *args, **kwargs):
+            # Override default parameters for stability
+            kwargs['align_corners'] = kwargs.get('align_corners', True)
+            kwargs['padding_mode'] = kwargs.get('padding_mode', 'reflection')
+            super().__init__(*args, **kwargs)
+        
+        def apply_transform(self, input: torch.Tensor, params, flags, transform=None):
+            # Apply transform
+            output = super().apply_transform(input, params, flags, transform)
+            
+            # Ensure output is in valid range
+            output = torch.clamp(output, -1.0, 1.0)
+            
+            return output
+
+else:
+    # Placeholder classes when Kornia is not available
+    class SafeRandomGamma:
+        """Placeholder when Kornia is not available"""
+        def __init__(self, *args, **kwargs):
+            raise ImportError("Kornia is required for SafeRandomGamma. Install with: pip install kornia")
     
-    def apply_transform(self, input: torch.Tensor, params, flags, transform=None):
-        # Apply transform
-        output = super().apply_transform(input, params, flags, transform)
-        
-        # Ensure output is in valid range
-        output = torch.clamp(output, -1.0, 1.0)
-        
-        return output
+    class StableElasticTransform:
+        """Placeholder when Kornia is not available"""
+        def __init__(self, *args, **kwargs):
+            raise ImportError("Kornia is required for StableElasticTransform. Install with: pip install kornia")
 
-
-# ==================== GPU Augmentation Module ====================
 
 class GPUAugmentation(nn.Module):
     """
@@ -205,6 +316,7 @@ class GPUAugmentation(nn.Module):
     1. Target(image)에는 Intensity Augmentation 적용 금지
     2. Geometric 변환만 Target에 적용
     3. Intensity 변환은 Condition(Pano)에만 적용
+    4. [FIX v5.8] Kornia 미설치 시 graceful fallback
     """
     def __init__(self, config, device='cuda'):
         super().__init__()
@@ -212,8 +324,6 @@ class GPUAugmentation(nn.Module):
         self.config = config
         self.debug = config.get('debug_augmentation', False)
         self.augment_from_epoch = config.get('augment_from_epoch', 10)
-        # [수정]: intensity_to_condition 옵션은 이제 무시됨 - 항상 condition에만 적용
-        # self.intensity_to_condition = config.get('intensity_to_condition', True)
         
         if not KORNIA_AVAILABLE:
             self.use_gpu_aug = False

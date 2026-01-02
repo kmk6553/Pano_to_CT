@@ -6,6 +6,9 @@ FIXES APPLIED:
 1. Scale factor 적용 - diffusion 생성물 decode 시 rescaling
 2. [v5.7] scale_factor를 필수 파라미터로 변경하여 누락 방지
 3. [v5.7] VAE 평가 시에도 scale_factor 로깅
+4. [FIX v5.8] Z-Consistency Metric 개선
+   - 기존: 인접 슬라이스 간 차이 (abs(slice1 - slice0)) - 작을수록 좋다고 판단하면 blurry 영상 유도
+   - 수정: GT와 예측의 gradient error 측정 (abs((pred[z+1] - pred[z]) - (gt[z+1] - gt[z])))
 """
 
 import torch
@@ -70,6 +73,62 @@ def compute_metrics(pred, target):
     }
 
 
+def compute_z_gradient_error(pred_volume, target_volume):
+    """
+    [FIX v5.8] 개선된 Z-Consistency Metric: Gradient Error 기반
+    
+    기존 방식의 문제:
+        - z_consistency = mean(|pred[z+1] - pred[z]|)
+        - 이 값이 작을수록 좋다고 판단하면 변화 없는(blurry) 영상 유도
+    
+    개선된 방식:
+        - GT의 Z축 변화량과 예측의 Z축 변화량 차이를 측정
+        - z_gradient_error = mean(|(pred[z+1] - pred[z]) - (gt[z+1] - gt[z])|)
+        - 이 값이 작을수록 GT와 유사한 Z축 변화 패턴을 학습
+    
+    Args:
+        pred_volume: [B, 1, D=3, H, W] or numpy array - predicted volume
+        target_volume: [B, 1, D=3, H, W] or numpy array - target volume
+    
+    Returns:
+        z_gradient_error: float - lower is better
+    """
+    if isinstance(pred_volume, torch.Tensor):
+        pred_np = pred_volume.cpu().numpy()
+    else:
+        pred_np = pred_volume
+    
+    if isinstance(target_volume, torch.Tensor):
+        target_np = target_volume.cpu().numpy()
+    else:
+        target_np = target_volume
+    
+    # Squeeze to [D, H, W] or [B, D, H, W]
+    pred_np = np.squeeze(pred_np)
+    target_np = np.squeeze(target_np)
+    
+    # Handle batch dimension
+    if pred_np.ndim == 4:
+        pred_np = pred_np[0]  # Take first batch item
+        target_np = target_np[0]
+    
+    # Compute Z-axis gradients
+    # pred_grad[z] = pred[z+1] - pred[z]
+    pred_grad_01 = pred_np[1] - pred_np[0]  # Gradient from slice 0 to 1
+    pred_grad_12 = pred_np[2] - pred_np[1]  # Gradient from slice 1 to 2
+    
+    target_grad_01 = target_np[1] - target_np[0]
+    target_grad_12 = target_np[2] - target_np[1]
+    
+    # Compute gradient error: |pred_grad - target_grad|
+    grad_error_01 = np.mean(np.abs(pred_grad_01 - target_grad_01))
+    grad_error_12 = np.mean(np.abs(pred_grad_12 - target_grad_12))
+    
+    z_gradient_error = (grad_error_01 + grad_error_12) / 2
+    
+    return z_gradient_error
+
+
 def compute_metrics_3d(pred_volume, target_volume):
     """
     Compute metrics for 3D volume (all 3 slices + middle slice separately)
@@ -79,6 +138,8 @@ def compute_metrics_3d(pred_volume, target_volume):
         target_volume: [B, 1, D=3, H, W] - target volume
     Returns:
         dict with metrics for each slice and average
+    
+    [FIX v5.8] Z-Consistency Metric 개선: Gradient Error 기반으로 변경
     """
     metrics = {}
     
@@ -110,12 +171,21 @@ def compute_metrics_3d(pred_volume, target_volume):
     metrics['mae'] = np.mean(all_mae)
     metrics['mse'] = np.mean(all_mse)
     
-    # Z-consistency metric: measure smoothness across slices
-    # Lower is better - measures difference between adjacent slices
-    pred_np = pred_volume.cpu().numpy()
+    # ============================================================
+    # [FIX v5.8] Z-Consistency Metric 개선
+    # 기존: 인접 슬라이스 간 차이 (blurry 영상 유도 가능)
+    # 수정: GT와 예측의 gradient error 측정
+    # ============================================================
+    metrics['z_gradient_error'] = compute_z_gradient_error(pred_volume, target_volume)
+    
+    # 기존 z_consistency도 참고용으로 유지 (lower = smoother, not necessarily better)
+    pred_np = pred_volume.cpu().numpy() if isinstance(pred_volume, torch.Tensor) else pred_volume
     z_diff_01 = np.mean(np.abs(pred_np[:, :, 0, :, :] - pred_np[:, :, 1, :, :]))
     z_diff_12 = np.mean(np.abs(pred_np[:, :, 1, :, :] - pred_np[:, :, 2, :, :]))
-    metrics['z_consistency'] = (z_diff_01 + z_diff_12) / 2
+    metrics['z_smoothness'] = (z_diff_01 + z_diff_12) / 2  # Renamed for clarity
+    
+    # Backward compatibility
+    metrics['z_consistency'] = metrics['z_gradient_error']  # Use gradient error as primary metric
     
     return metrics
 
@@ -187,7 +257,9 @@ def visualize_3slice_comparison(condition, pred_volume, target_volume, save_path
         metrics_text += f"Avg PSNR: {metrics.get('psnr', 0):.2f} dB\n"
         metrics_text += f"Avg SSIM: {metrics.get('ssim', 0):.3f}\n"
         metrics_text += f"Avg MAE: {metrics.get('mae', 0):.4f}\n"
-        metrics_text += f"Z-Consistency: {metrics.get('z_consistency', 0):.4f}\n"
+        # [FIX v5.8] 개선된 z_gradient_error 표시
+        metrics_text += f"Z-Gradient Error: {metrics.get('z_gradient_error', 0):.4f}\n"
+        metrics_text += f"Z-Smoothness: {metrics.get('z_smoothness', 0):.4f}\n"
         metrics_text += "\n--- Per Slice ---\n"
         metrics_text += f"Mid PSNR: {metrics.get('mid_psnr', 0):.2f} dB\n"
         metrics_text += f"Mid SSIM: {metrics.get('mid_ssim', 0):.3f}\n"
@@ -279,6 +351,9 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
     FIXES (v5.7):
         - scale_factor가 None이면 기본값 0.18215 사용하되 경고 출력
         - Diffusion 평가 시 scale_factor 필수
+    
+    FIXES (v5.8):
+        - Z-Consistency Metric 개선: Gradient Error 기반
     """
     # ============================================================
     # [v5.7] scale_factor 검증
@@ -489,7 +564,9 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
         logger.info(f"Average SSIM: {avg_metrics.get('ssim', 0):.3f}")
         logger.info(f"Average MAE: {avg_metrics.get('mae', 0):.4f}")
         logger.info(f"Average MSE: {avg_metrics.get('mse', 0):.4f}")
-        logger.info(f"Z-Consistency: {avg_metrics.get('z_consistency', 0):.4f}")
+        # [FIX v5.8] 개선된 Z-Consistency Metric 로깅
+        logger.info(f"Z-Gradient Error: {avg_metrics.get('z_gradient_error', 0):.4f} (lower = better GT alignment)")
+        logger.info(f"Z-Smoothness: {avg_metrics.get('z_smoothness', 0):.4f} (lower = smoother, not always better)")
         logger.info(f"\n--- Per-Slice Metrics ---")
         logger.info(f"Prev PSNR: {avg_metrics.get('prev_psnr', 0):.2f} dB, SSIM: {avg_metrics.get('prev_ssim', 0):.3f}")
         logger.info(f"Mid  PSNR: {avg_metrics.get('mid_psnr', 0):.2f} dB, SSIM: {avg_metrics.get('mid_ssim', 0):.3f}")
@@ -507,6 +584,9 @@ def evaluate_and_visualize(vae, diffusion_model, diffusion_process, val_loader,
             for key, value in avg_metrics.items():
                 f.write(f"{key}: {value:.4f}\n")
             f.write(f"\nScale Factor: {scale_factor}\n")
+            f.write(f"\n[v5.8] Z-Gradient Error measures how well the model\n")
+            f.write(f"       captures GT's slice-to-slice changes.\n")
+            f.write(f"       Lower = better alignment with GT transitions.\n")
 
 
 def evaluate_sliding_window(vae, diffusion_model, diffusion_process, pano_volume, 

@@ -12,6 +12,7 @@ FIXES APPLIED:
 7. Image-space 보조 loss에 mid_weight 적용 (MSE는 균등 유지) (v5.4)
 8. [신규] VAE 학습에 GDL 추가 및 균등 가중치(Equal Weight) 적용 (v5.5)
 9. [신규] VAE Autocast 조건 수정 - use_amp 파라미터 기반으로 변경 (v5.6)
+10. [FIX v5.8] CFG Dropout을 샘플별 독립 마스크로 변경 (배치 전체 일괄 적용 문제 수정)
 """
 
 import torch
@@ -454,6 +455,9 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     6. Image-space 보조 loss에 mid_weight 적용 (v5.4)
        - MSE(노이즈 예측)는 균등 유지: z-연속성 학습에 기여
        - Image-space loss에만 mid_weight 적용: 최종 출력 품질 최적화
+    7. [FIX v5.8] CFG Dropout을 샘플별 독립 마스크로 변경
+       - 기존: 배치 전체에 일괄 적용 (np.random.rand() < prob)
+       - 수정: 각 샘플별로 독립적인 dropout 마스크 생성
     """
     diffusion_model.train()
     vae.eval()
@@ -486,6 +490,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         logger.info(f"  - Encoding type: {encoding_type}")
         logger.info(f"  - Mid-slice weight (image-space only): {mid_weight}")
         logger.info(f"  - MSE loss: uniform weighting (for z-continuity)")
+        logger.info(f"  - [FIX v5.8] CFG Dropout: Per-sample independent masking")
         if not use_stochastic_encoding:
             logger.info(f"    (Using z=mean for better structural accuracy)")
     
@@ -560,11 +565,15 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         noise = torch.randn_like(z)
         noisy_z = diffusion_process.q_sample(z, t, noise)
         
-        # CFG: randomly drop condition
-        if np.random.rand() < cfg_dropout_prob:
-            condition_input = torch.zeros_like(condition)
-        else:
-            condition_input = condition
+        # ============================================================
+        # [FIX v5.8] CFG Dropout - 샘플별 독립 마스크 생성
+        # 기존: np.random.rand() < cfg_dropout_prob (배치 전체 일괄 적용)
+        # 수정: 각 샘플별로 독립적인 dropout 마스크 생성
+        # ============================================================
+        cfg_mask = torch.bernoulli(
+            torch.full((batch_size, 1, 1, 1), 1 - cfg_dropout_prob, device=device)
+        )
+        condition_input = condition * cfg_mask
         
         # Self-conditioning
         x_self_cond = None
@@ -801,6 +810,7 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                             pred_type=diffusion_process.prediction_type,
                             encoding_type=encoding_type,
                             mid_weight=mid_weight,
+                            cfg_dropout='per_sample',  # [FIX v5.8] 로깅
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
                             nan_count=nan_count,

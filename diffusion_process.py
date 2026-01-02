@@ -1,6 +1,10 @@
 """
 Diffusion process implementation with v-parametrization and CFG
 Supports 3D latent volumes [B, C, D=3, h, w]
+
+FIXES APPLIED (v5.8):
+1. [치명적] Latent Clamping 범위 확장: [-1, 1] -> [-3, 3] (SSIM 0.5 답보 해결)
+2. [버그] DDIM Sampling 시 Device Mismatch 수정
 """
 
 import torch
@@ -15,7 +19,8 @@ class DiffusionProcess(nn.Module):
     Supports both 2D [B, C, H, W] and 3D [B, C, D, H, W] latent representations
     """
     def __init__(self, num_timesteps=1000, beta_start=0.0001, beta_end=0.02, 
-                 schedule='cosine', prediction_type='v'):
+                 schedule='cosine', prediction_type='v',
+                 latent_clamp_range=3.0):
         """
         Args:
             num_timesteps: Number of diffusion timesteps
@@ -23,10 +28,13 @@ class DiffusionProcess(nn.Module):
             beta_end: Ending beta value
             schedule: 'linear' or 'cosine'
             prediction_type: 'v', 'epsilon', or 'x0'
+            latent_clamp_range: Clamp range for latent (default: 3.0 for [-3, 3])
+                                VAE latent는 N(0,1) 분포를 따르므로 [-3, 3] 범위가 적절
         """
         super().__init__()
         self.num_timesteps = num_timesteps
         self.prediction_type = prediction_type
+        self.latent_clamp_range = latent_clamp_range  # [FIX v5.8] 설정 가능한 클램프 범위
         
         # Beta schedule
         if schedule == 'linear':
@@ -139,6 +147,9 @@ class DiffusionProcess(nn.Module):
             x_self_cond: Previous prediction for self-conditioning
             clip_denoised: Whether to clip predicted x0
             guidance_scale: CFG scale (1.0 = no guidance)
+        
+        FIXED (v5.8): Latent clamp 범위를 [-1, 1]에서 [-3, 3]으로 확장
+                      VAE latent는 N(0,1) 분포를 따르므로 [-3, 3] 범위가 적절
         """
         # Model prediction
         model_output = model(x_t, t, cond, slice_pos, x_self_cond)
@@ -161,8 +172,13 @@ class DiffusionProcess(nn.Module):
         else:
             raise ValueError(f"Unknown prediction type: {self.prediction_type}")
         
+        # ============================================================
+        # [FIX v5.8] Latent Clamping 범위 확장
+        # 기존: torch.clamp(x_0_pred, -1, 1) - 고주파 정보 파괴
+        # 수정: torch.clamp(x_0_pred, -3, 3) - VAE latent 분포 보존
+        # ============================================================
         if clip_denoised:
-            x_0_pred = torch.clamp(x_0_pred, -1, 1)
+            x_0_pred = torch.clamp(x_0_pred, -self.latent_clamp_range, self.latent_clamp_range)
         
         # Posterior mean and variance
         posterior_mean_coef1_t = self._expand_dims(self.posterior_mean_coef1[t], x_t)
@@ -265,6 +281,10 @@ class DiffusionProcess(nn.Module):
         Args:
             ddim_steps: Number of DDIM steps (fewer than num_timesteps)
             eta: DDIM stochasticity (0 = deterministic, 1 = DDPM)
+        
+        FIXED (v5.8): 
+            1. Device mismatch 수정 - alpha_t_prev 생성 시 device 명시
+            2. Latent clamp 범위 확장 [-1, 1] -> [-3, 3]
         """
         batch_size = shape[0]
         
@@ -296,7 +316,10 @@ class DiffusionProcess(nn.Module):
             else:
                 x0_pred = model_output
             
-            x0_pred = torch.clamp(x0_pred, -1, 1)
+            # ============================================================
+            # [FIX v5.8] Latent Clamping 범위 확장
+            # ============================================================
+            x0_pred = torch.clamp(x0_pred, -self.latent_clamp_range, self.latent_clamp_range)
             
             # Self-conditioning
             if use_self_conditioning:
@@ -310,7 +333,16 @@ class DiffusionProcess(nn.Module):
             
             # DDIM update
             alpha_t = self.alphas_cumprod[t]
-            alpha_t_prev = self.alphas_cumprod[t_prev] if t_prev > 0 else torch.tensor(1.0)
+            
+            # ============================================================
+            # [FIX v5.8] Device Mismatch 수정
+            # 기존: torch.tensor(1.0) - CPU에 생성됨
+            # 수정: torch.tensor(1.0, device=device) - 올바른 device에 생성
+            # ============================================================
+            if t_prev > 0:
+                alpha_t_prev = self.alphas_cumprod[t_prev]
+            else:
+                alpha_t_prev = torch.tensor(1.0, device=device, dtype=alpha_t.dtype)
             
             # Expand for broadcasting
             alpha_t = self._expand_dims(alpha_t.unsqueeze(0).expand(batch_size), x)

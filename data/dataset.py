@@ -8,6 +8,9 @@ FIXES APPLIED:
    - normalize_volumes=False: 변환 없음 (데이터가 이미 [-1,1]이라고 가정)
    - 하단의 중복 정규화 블록 완전 제거
 2. 디버그용 min/max 로깅 추가 (선택적)
+3. [FIX v5.8] Slice별 독립 Augmentation 문제 수정
+   - 기존: 3장의 슬라이스에 각각 별도로 Augmentation 적용 (Z축 일관성 파괴)
+   - 수정: 동일한 Augmentation 파라미터를 3장 모두에 적용
 """
 
 import torch
@@ -33,6 +36,10 @@ class OptimizedDentalSliceDataset(Dataset):
     Normalization Policy (v5.7):
         - normalize_volumes=True: 데이터가 [0, 1] 범위라고 가정하고 [-1, 1]로 변환
         - normalize_volumes=False: 데이터가 이미 [-1, 1] 범위라고 가정하고 변환 없음
+    
+    Augmentation Policy (v5.8):
+        - 3장의 슬라이스에 동일한 Augmentation 파라미터 적용
+        - Z축 일관성 보존
     """
     def __init__(self, root_dir, folders, slice_range=(0, 120), augment=True, 
                  panorama_type='axial', normalize_volumes=True, augment_config=None,
@@ -105,6 +112,14 @@ class OptimizedDentalSliceDataset(Dataset):
             logger.info("  - Input data expected range: [-1, 1]")
             logger.info("  - Output data range: [-1, 1] (no transformation)")
             logger.info("  - Transformation: None (passthrough)")
+            logger.info("="*60)
+        
+        # [FIX v5.8] Log augmentation policy
+        if augment and augment_config:
+            logger.info("="*60)
+            logger.info("AUGMENTATION POLICY (v5.8):")
+            logger.info("  - 3-slice window에 동일한 파라미터 적용")
+            logger.info("  - Z축 일관성 보존")
             logger.info("="*60)
     
     def _get_volume_memmap(self, path):
@@ -434,12 +449,19 @@ class OptimizedDentalSliceDataset(Dataset):
         # Get 3-slice panorama condition (normalization is handled inside _get_pano_3window)
         pano_window = self._get_pano_3window(volume_idx, slice_idx)
         
-        # Apply augmentation (same transform to all 3 slices)
+        # ============================================================
+        # [FIX v5.8] Slice별 독립 Augmentation 문제 수정
+        # 기존: 각 슬라이스에 별도로 Augmentation 적용 (Z축 일관성 파괴)
+        # 수정: 동일한 파라미터를 3장 모두에 적용
+        # ============================================================
         if self.augment and self.data_augmentation is not None:
-            # Augment each slice pair consistently
+            # 파라미터를 한 번만 샘플링
+            aug_params = self.data_augmentation.sample_params(epoch=self.current_epoch)
+            
+            # 동일한 파라미터로 모든 슬라이스에 적용
             for i in range(3):
-                ct_window[i], pano_window[i] = self.data_augmentation.apply(
-                    ct_window[i], pano_window[i], epoch=self.current_epoch
+                ct_window[i], pano_window[i] = self.data_augmentation.apply_with_params(
+                    ct_window[i], pano_window[i], aug_params, epoch=self.current_epoch
                 )
         
         # Convert to tensors

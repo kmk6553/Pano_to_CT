@@ -11,6 +11,11 @@ FIXES APPLIED:
 3. [FIX v5.8] Slice별 독립 Augmentation 문제 수정
    - 기존: 3장의 슬라이스에 각각 별도로 Augmentation 적용 (Z축 일관성 파괴)
    - 수정: 동일한 Augmentation 파라미터를 3장 모두에 적용
+4. [FIX v5.10] Memmap 일관성 수정
+   - 기존: CT는 no_memmap 적용되지만 Pano는 여전히 memmap 사용 가능
+   - 수정: use_memmap 플래그가 CT와 Pano 모두에 일관되게 적용
+   - _get_pano_slice_directly() 메서드 추가
+   - memmap 핸들 관리 개선 (cache_volumes와 무관하게 핸들 유지)
 """
 
 import torch
@@ -40,6 +45,11 @@ class OptimizedDentalSliceDataset(Dataset):
     Augmentation Policy (v5.8):
         - 3장의 슬라이스에 동일한 Augmentation 파라미터 적용
         - Z축 일관성 보존
+    
+    I/O Policy (v5.10):
+        - use_memmap=True: Memory-mapped I/O 사용 (빠르지만 파일 핸들 소비)
+        - use_memmap=False: 직접 파일 읽기 (느리지만 안정적)
+        - CT와 Pano 모두에 동일하게 적용
     """
     def __init__(self, root_dir, folders, slice_range=(0, 120), augment=True, 
                  panorama_type='axial', normalize_volumes=True, augment_config=None,
@@ -57,7 +67,7 @@ class OptimizedDentalSliceDataset(Dataset):
             augment_config: Configuration for data augmentation
             pano_triplet: Always True for 3D slab
             cache_volumes: Whether to cache volumes in memory
-            use_memmap: Whether to use memory-mapped files
+            use_memmap: Whether to use memory-mapped files (applies to both CT and Pano)
             debug_normalization: If True, log min/max values for debugging
         """
         self.root_dir = root_dir
@@ -120,35 +130,51 @@ class OptimizedDentalSliceDataset(Dataset):
             logger.info("AUGMENTATION POLICY (v5.8):")
             logger.info("  - 3-slice window에 동일한 파라미터 적용")
             logger.info("  - Z축 일관성 보존")
+            logger.info("  - [v5.10] CT/Pano 정합성이 보장된 elastic deformation")
             logger.info("="*60)
+        
+        # [FIX v5.10] Log I/O policy
+        logger.info("="*60)
+        logger.info(f"I/O POLICY (v5.10): use_memmap={use_memmap}")
+        if use_memmap:
+            logger.info("  - Memory-mapped I/O 사용 (CT and Pano)")
+            logger.info("  - 빠르지만 파일 핸들 소비")
+        else:
+            logger.info("  - 직접 파일 읽기 사용 (CT and Pano)")
+            logger.info("  - 느리지만 안정적 (Windows 호환성 향상)")
+        logger.info(f"  - cache_volumes={cache_volumes}")
+        logger.info("="*60)
     
     def _get_volume_memmap(self, path):
-        """Get memory-mapped volume for efficient access"""
-        if not self.cache_volumes and path in self._memmap_cache:
+        """
+        Get memory-mapped volume for efficient access
+        
+        [FIX v5.10] memmap 핸들을 항상 캐시에 유지 (cache_volumes와 무관)
+        이렇게 하면 매 샘플마다 memmap 객체를 새로 만드는 것을 방지
+        """
+        if path in self._memmap_cache:
             return self._memmap_cache[path]
         
-        if path not in self._memmap_cache:
-            if os.path.exists(path):
-                try:
-                    memmap = np.memmap(
-                        path, 
-                        dtype=np.float32, 
-                        mode='r',
-                        shape=self.volume_shape,
-                        order='C'
-                    )
-                    if self.cache_volumes:
-                        self._memmap_cache[path] = memmap
-                    return memmap
-                except Exception as e:
-                    logger.warning(f"Failed to create memmap for {path}: {e}")
-                    data = np.fromfile(path, dtype=np.float32)
-                    return data.reshape(self.volume_shape, order='C')
-            else:
-                logger.error(f"Volume file not found: {path}")
-                return None
-        
-        return self._memmap_cache[path]
+        if os.path.exists(path):
+            try:
+                memmap = np.memmap(
+                    path, 
+                    dtype=np.float32, 
+                    mode='r',
+                    shape=self.volume_shape,
+                    order='C'
+                )
+                # [FIX v5.10] 항상 캐시에 저장 (파일 핸들 재사용)
+                self._memmap_cache[path] = memmap
+                return memmap
+            except Exception as e:
+                logger.warning(f"Failed to create memmap for {path}: {e}")
+                # Fallback to direct read
+                data = np.fromfile(path, dtype=np.float32)
+                return data.reshape(self.volume_shape, order='C')
+        else:
+            logger.error(f"Volume file not found: {path}")
+            return None
     
     def _get_volume_cached(self, path, folder):
         """Get volume with caching"""
@@ -157,17 +183,47 @@ class OptimizedDentalSliceDataset(Dataset):
         if self.cache_volumes and cache_key in self._volume_cache:
             return self._volume_cache[cache_key]
         
-        volume = self._get_volume_memmap(path)
+        # [FIX v5.10] use_memmap 플래그에 따라 분기
+        if self.use_memmap:
+            volume = self._get_volume_memmap(path)
+        else:
+            # 직접 파일 읽기
+            volume = self._read_volume_directly(path)
         
         if volume is None:
             return None
         
         if self.cache_volumes:
-            volume = np.array(volume, copy=True)
+            # memmap이면 복사해서 캐시 (numpy array로 변환)
+            if isinstance(volume, np.memmap):
+                volume = np.array(volume, copy=True)
             if self.persistent_cache:
                 self._volume_cache[cache_key] = volume
         
         return volume
+    
+    def _read_volume_directly(self, path):
+        """
+        [FIX v5.10] 전체 볼륨을 직접 읽기 (memmap 사용 안 함)
+        """
+        if not os.path.exists(path):
+            logger.error(f"Volume file not found: {path}")
+            return None
+        
+        try:
+            data = np.fromfile(path, dtype=np.float32)
+            expected_size = self.volume_shape[0] * self.volume_shape[1] * self.volume_shape[2]
+            
+            if data.size != expected_size:
+                logger.warning(f"Volume size mismatch: expected {expected_size}, got {data.size}")
+                # Try to reshape anyway
+                inferred_slices = data.size // (self.volume_shape[1] * self.volume_shape[2])
+                return data.reshape(inferred_slices, self.volume_shape[1], self.volume_shape[2])
+            
+            return data.reshape(self.volume_shape, order='C')
+        except Exception as e:
+            logger.error(f"Error reading volume from {path}: {e}")
+            return None
     
     def _read_slice_directly(self, path, slice_idx):
         """Read a single slice directly from file without loading entire volume"""
@@ -177,7 +233,7 @@ class OptimizedDentalSliceDataset(Dataset):
         
         try:
             slice_size = self.volume_shape[1] * self.volume_shape[2]
-            offset = slice_idx * slice_size * 4
+            offset = slice_idx * slice_size * 4  # 4 bytes per float32
             
             with open(path, 'rb') as f:
                 f.seek(offset)
@@ -190,10 +246,15 @@ class OptimizedDentalSliceDataset(Dataset):
             return None
     
     def _get_volume_or_slice(self, path, folder, slice_idx=None):
-        """Get volume or specific slice based on caching settings"""
+        """
+        Get volume or specific slice based on caching settings
+        
+        [FIX v5.10] use_memmap 플래그를 일관되게 적용
+        """
         if slice_idx is None:
             return self._get_volume_cached(path, folder)
         
+        # 캐시된 볼륨이 있으면 사용
         if self.cache_volumes:
             volume = self._get_volume_cached(path, folder)
             if volume is not None:
@@ -203,13 +264,52 @@ class OptimizedDentalSliceDataset(Dataset):
                     return volume[slice_idx, :, :]
             return None
         
-        if not self.use_memmap:
-            return self._read_slice_directly(path, slice_idx)
-        else:
+        # 캐시 없이 직접 읽기
+        if self.use_memmap:
             volume = self._get_volume_memmap(path)
             if volume is not None:
                 return np.array(volume[slice_idx, :, :])
             return None
+        else:
+            # [FIX v5.10] memmap 사용 안 함 - 직접 슬라이스 읽기
+            return self._read_slice_directly(path, slice_idx)
+    
+    def _get_pano_slice_directly(self, path, slice_idx):
+        """
+        [FIX v5.10] Pano 슬라이스를 직접 읽기 (memmap 사용 안 함)
+        CT의 _read_slice_directly와 동일한 로직
+        """
+        return self._read_slice_directly(path, slice_idx)
+    
+    def _get_pano_volume_or_slice(self, path, folder, slice_idx=None):
+        """
+        [FIX v5.10] Pano 볼륨 또는 슬라이스 읽기
+        CT와 동일한 use_memmap 정책 적용
+        """
+        cache_key = folder + '_pano'
+        
+        if slice_idx is None:
+            return self._get_volume_cached(path, cache_key)
+        
+        # 캐시된 볼륨이 있으면 사용
+        if self.cache_volumes:
+            volume = self._get_volume_cached(path, cache_key)
+            if volume is not None:
+                if isinstance(volume, np.memmap):
+                    return np.array(volume[slice_idx, :, :])
+                else:
+                    return volume[slice_idx, :, :]
+            return None
+        
+        # 캐시 없이 직접 읽기
+        if self.use_memmap:
+            volume = self._get_volume_memmap(path)
+            if volume is not None:
+                return np.array(volume[slice_idx, :, :])
+            return None
+        else:
+            # [FIX v5.10] memmap 사용 안 함 - 직접 슬라이스 읽기
+            return self._get_pano_slice_directly(path, slice_idx)
     
     def _get_3slice_window(self, path, folder, center_idx):
         """
@@ -358,6 +458,8 @@ class OptimizedDentalSliceDataset(Dataset):
         """
         Get 3-slice panorama window
         
+        [FIX v5.10] use_memmap 플래그를 Pano에도 일관되게 적용
+        
         Returns:
             [3, H, W] numpy array - panorama at (prev, mid, next) positions
         """
@@ -372,32 +474,53 @@ class OptimizedDentalSliceDataset(Dataset):
         pano_slices = []
         
         for idx in [prev_idx, center_idx, next_idx]:
+            pano_2d = None
+            
             if os.path.exists(pano_path):
                 try:
-                    pano_volume = self._get_volume_cached(pano_path, folder + '_pano')
-                    if pano_volume is not None:
-                        pano_2d = self.extract_panorama(pano_volume, pano_volume, idx)
+                    # [FIX v5.10] use_memmap 플래그에 따라 Pano도 동일하게 처리
+                    if self.panorama_type == 'axial':
+                        # axial일 때는 슬라이스 단위 읽기 가능
+                        pano_2d = self._get_pano_volume_or_slice(pano_path, folder, idx)
+                    else:
+                        # 다른 타입은 전체 볼륨 필요
+                        pano_volume = self._get_volume_cached(pano_path, folder + '_pano')
+                        if pano_volume is not None:
+                            pano_2d = self.extract_panorama(pano_volume, pano_volume, idx)
+                    
+                    if pano_2d is not None:
                         # Apply normalization only if normalize_volumes=True
                         if self.normalize_volumes:
                             pano_2d = self.normalize_slice(pano_2d, folder + '_pano')
                     else:
                         pano_2d = np.zeros((200, 200), dtype=np.float32)
+                        
                 except Exception as e:
                     logger.warning(f"Error loading panorama for {folder}: {e}, using zeros")
                     pano_2d = np.zeros((200, 200), dtype=np.float32)
             else:
                 # Fall back to CT volume for panorama extraction
                 try:
-                    ct_volume = self._get_volume_cached(ct_path, folder)
-                    if ct_volume is not None:
-                        pano_2d = self.extract_panorama(ct_volume, ct_volume, idx)
+                    if self.panorama_type == 'axial':
+                        # [FIX v5.10] CT도 동일한 로직으로 처리
+                        pano_2d = self._get_volume_or_slice(ct_path, folder, idx)
+                    else:
+                        ct_volume = self._get_volume_cached(ct_path, folder)
+                        if ct_volume is not None:
+                            pano_2d = self.extract_panorama(ct_volume, ct_volume, idx)
+                    
+                    if pano_2d is not None:
                         # Apply normalization only if normalize_volumes=True
                         if self.normalize_volumes:
                             pano_2d = self.normalize_slice(pano_2d, folder)
                     else:
                         pano_2d = np.zeros((200, 200), dtype=np.float32)
-                except:
+                except Exception as e:
+                    logger.warning(f"Error loading CT for pano fallback: {e}")
                     pano_2d = np.zeros((200, 200), dtype=np.float32)
+            
+            if pano_2d is None:
+                pano_2d = np.zeros((200, 200), dtype=np.float32)
             
             pano_slices.append(pano_2d)
         
@@ -453,6 +576,7 @@ class OptimizedDentalSliceDataset(Dataset):
         # [FIX v5.8] Slice별 독립 Augmentation 문제 수정
         # 기존: 각 슬라이스에 별도로 Augmentation 적용 (Z축 일관성 파괴)
         # 수정: 동일한 파라미터를 3장 모두에 적용
+        # [FIX v5.10] CT/Pano 정합성이 보장된 elastic deformation 사용
         # ============================================================
         if self.augment and self.data_augmentation is not None:
             # 파라미터를 한 번만 샘플링

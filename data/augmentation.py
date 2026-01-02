@@ -5,6 +5,9 @@ FIXES APPLIED:
 1. GT CT(Target)에는 Intensity Augmentation 적용 금지
 2. Geometric 변환은 유지하되, 밝기/노이즈 변환은 Condition(Pano)에만 적용
 3. [FIX v5.8] Kornia 미설치 시 Import 에러 수정 - 클래스 정의를 조건문 안으로 이동
+4. [FIX v5.10] CPU ElasticTransform 정합성 수정
+   - 기존: CT와 Pano에 각각 elastic() 호출 시 서로 다른 난수 사용 → 정합성 파괴
+   - 수정: RandomState를 복제하여 완전히 동일한 변형 적용
 """
 
 import torch
@@ -12,6 +15,7 @@ import torch.nn as nn
 import numpy as np
 from scipy.ndimage import rotate, map_coordinates, gaussian_filter
 import logging
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +35,57 @@ except ImportError:
 
 
 class ElasticTransform:
-    """Elastic deformation of images with optional affine transformation"""
+    """
+    Elastic deformation of images with optional affine transformation
+    
+    [FIX v5.10] 정합성 보장을 위한 개선:
+    - get_random_state() 메서드 추가: 현재 RandomState 복제본 반환
+    - set_random_state() 메서드 추가: RandomState 설정
+    - 이를 통해 CT와 Pano에 완전히 동일한 변형 적용 가능
+    """
     def __init__(self, alpha, sigma, alpha_affine, random_state=None):
         self.alpha = alpha
         self.sigma = sigma
         self.alpha_affine = alpha_affine
         self.random_state = random_state
+        self._internal_random_state = None  # 내부 사용 RandomState
     
-    def __call__(self, image):
-        if self.random_state is None:
-            random_state = np.random.RandomState(None)
-        else:
+    def get_random_state_copy(self):
+        """
+        [FIX v5.10] 현재 RandomState의 복제본 반환
+        이를 통해 동일한 변형을 여러 이미지에 적용 가능
+        """
+        if self._internal_random_state is not None:
+            # numpy RandomState의 상태를 복제
+            state_copy = np.random.RandomState()
+            state_copy.set_state(self._internal_random_state.get_state())
+            return state_copy
+        return None
+    
+    def set_random_state(self, random_state):
+        """[FIX v5.10] RandomState 설정"""
+        self._internal_random_state = random_state
+    
+    def __call__(self, image, random_state_override=None):
+        """
+        Apply elastic transformation
+        
+        Args:
+            image: 2D numpy array
+            random_state_override: Optional RandomState to use (for alignment)
+        
+        Returns:
+            Transformed image
+        """
+        # RandomState 결정 우선순위: override > internal > instance > new
+        if random_state_override is not None:
+            random_state = random_state_override
+        elif self._internal_random_state is not None:
+            random_state = self._internal_random_state
+        elif self.random_state is not None:
             random_state = self.random_state
+        else:
+            random_state = np.random.RandomState(None)
         
         shape = image.shape
         shape_size = shape[:2]
@@ -86,12 +129,28 @@ class ElasticTransform:
         return map_coordinates(image, indices, order=1, mode='reflect').reshape(shape)
 
 
+def _copy_random_state(random_state):
+    """
+    [FIX v5.10] RandomState 복제 헬퍼 함수
+    동일한 난수 시퀀스를 생성하기 위해 상태를 복제
+    """
+    if random_state is None:
+        return None
+    state_copy = np.random.RandomState()
+    state_copy.set_state(random_state.get_state())
+    return state_copy
+
+
 class DataAugmentation:
     """
     Advanced data augmentation for medical images (CPU-based)
     
     [FIX v5.8] 3-slice window에 동일한 augmentation 파라미터 적용을 위한
                apply_consistent() 메서드 추가
+    
+    [FIX v5.10] CT/Pano 정합성 보장
+               - elastic_deformation_aligned() 메서드 추가
+               - RandomState를 복제하여 CT와 Pano에 동일한 변형 적용
     """
     def __init__(self, config):
         self.config = config
@@ -128,7 +187,12 @@ class DataAugmentation:
         return image, pano
     
     def elastic_deformation(self, image, pano, epoch=None, do_elastic=None, random_state=None):
-        """Apply elastic deformation with reduced intensity"""
+        """
+        Apply elastic deformation with reduced intensity
+        
+        [DEPRECATED] 이 메서드는 정합성 문제가 있을 수 있음.
+        elastic_deformation_aligned() 사용 권장.
+        """
         # Disable elastic deformation in early epochs
         if epoch is not None and epoch < self.augment_from_epoch:
             return image, pano
@@ -150,6 +214,69 @@ class DataAugmentation:
             else:
                 image = self.elastic(image)
                 pano = self.elastic(pano)
+        return image, pano
+    
+    def elastic_deformation_aligned(self, image, pano, epoch=None, do_elastic=None, elastic_seed=None):
+        """
+        [FIX v5.10] CT/Pano 정합성이 보장된 elastic deformation
+        
+        핵심: RandomState를 복제하여 CT와 Pano에 완전히 동일한 난수 시퀀스 적용
+        
+        Args:
+            image: CT slice
+            pano: Panorama slice  
+            epoch: Current epoch
+            do_elastic: Whether to apply elastic (None=random decision)
+            elastic_seed: Seed for RandomState (for reproducibility across 3-slice window)
+        
+        Returns:
+            (transformed_image, transformed_pano) - 동일한 기하학적 변형이 적용됨
+        """
+        # Disable elastic deformation in early epochs
+        if epoch is not None and epoch < self.augment_from_epoch:
+            return image, pano
+        
+        if do_elastic is None:
+            do_elastic = np.random.rand() > 0.9
+        
+        if not (self.use_elastic and do_elastic):
+            return image, pano
+        
+        # Create base RandomState from seed
+        if elastic_seed is not None:
+            base_random_state = np.random.RandomState(elastic_seed)
+        else:
+            base_random_state = np.random.RandomState()
+        
+        # ============================================================
+        # [FIX v5.10] 핵심 수정: RandomState 복제
+        # CT용과 Pano용으로 동일한 상태의 RandomState를 각각 생성
+        # 이렇게 하면 두 이미지에 완전히 동일한 변형이 적용됨
+        # ============================================================
+        
+        # CT용 RandomState (base 상태 복제)
+        ct_random_state = _copy_random_state(base_random_state)
+        
+        # Pano용 RandomState (base 상태 복제 - CT용과 동일한 초기 상태)
+        pano_random_state = _copy_random_state(base_random_state)
+        
+        # Create elastic transforms with copied states
+        elastic_for_ct = ElasticTransform(
+            alpha=self.config.get('elastic_alpha', 10),
+            sigma=self.config.get('elastic_sigma', 4),
+            alpha_affine=self.config.get('elastic_alpha_affine', 10)
+        )
+        
+        elastic_for_pano = ElasticTransform(
+            alpha=self.config.get('elastic_alpha', 10),
+            sigma=self.config.get('elastic_sigma', 4),
+            alpha_affine=self.config.get('elastic_alpha_affine', 10)
+        )
+        
+        # Apply with copied RandomStates - 동일한 난수 시퀀스 사용
+        image = elastic_for_ct(image, random_state_override=ct_random_state)
+        pano = elastic_for_pano(pano, random_state_override=pano_random_state)
+        
         return image, pano
     
     def gamma_correction(self, image, gamma=None):
@@ -189,11 +316,15 @@ class DataAugmentation:
         
         [수정]: Intensity augmentation (gamma, noise)는 Pano에만 적용
         Target CT는 기하학적 변환만 유지
+        
+        [FIX v5.10]: elastic_deformation_aligned() 사용으로 정합성 보장
         """
         # Geometric augmentations (apply to both)
         image, pano = self.random_flip(image, pano)
         image, pano = self.random_rotation(image, pano)
-        image, pano = self.elastic_deformation(image, pano, epoch)
+        
+        # [FIX v5.10] 정합성이 보장된 elastic deformation 사용
+        image, pano = self.elastic_deformation_aligned(image, pano, epoch)
         
         # [수정]: Intensity augmentations - Pano에만 적용, Target CT는 제외
         pano = self.gamma_correction(pano)
@@ -224,6 +355,7 @@ class DataAugmentation:
     def apply_with_params(self, image, pano, params, epoch=None):
         """
         [FIX v5.8] 미리 샘플링된 파라미터로 augmentation 적용
+        [FIX v5.10] elastic_deformation_aligned() 사용으로 CT/Pano 정합성 보장
         
         Args:
             image: CT slice
@@ -240,11 +372,14 @@ class DataAugmentation:
                                            angle=params['rotation_angle'],
                                            do_rotate=params['do_rotate'])
         
+        # [FIX v5.10] 정합성이 보장된 elastic deformation
         if params['do_elastic']:
-            random_state = np.random.RandomState(params['elastic_seed'])
-            image, pano = self.elastic_deformation(image, pano, epoch=epoch,
-                                                   do_elastic=True,
-                                                   random_state=random_state)
+            image, pano = self.elastic_deformation_aligned(
+                image, pano, 
+                epoch=epoch,
+                do_elastic=True,
+                elastic_seed=params['elastic_seed']
+            )
         
         # Intensity augmentations - Pano에만 적용
         if params['do_gamma']:

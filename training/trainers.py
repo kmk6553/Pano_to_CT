@@ -14,6 +14,7 @@ FIXES APPLIED:
 9. [신규] VAE Autocast 조건 수정 - use_amp 파라미터 기반으로 변경 (v5.6)
 10. [FIX v5.8] CFG Dropout을 샘플별 독립 마스크로 변경 (배치 전체 일괄 적용 문제 수정)
 11. [FIX v5.9] x0_pred Latent Clamp 범위 확장: [-1, 1] -> [-3, 3] (고주파 정보 손실 방지)
+12. [NEW v5.11] VAE 학습에 Charbonnier(L1) Loss 추가
 """
 
 import torch
@@ -185,6 +186,7 @@ def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=None):
 def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, config, metrics_tracker, 
               lpips_loss_fn=None, lpips_weight=0.1, scaler=None, accumulation_steps=1,
               gpu_augmenter=None, gdl_loss_fn=None, gdl_weight=0.0,
+              l1_loss_fn=None, l1_weight=0.0,
               use_amp=False, autocast_dtype=torch.float16):
     """
     Optimized 3D VAE training with async prefetching and GPU augmentation
@@ -196,10 +198,13 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     2. [수정 v5.5]: VAE 학습 시 균등 가중치(Equal Weight) 사용 - mid_weight=None
     3. [수정 v5.5]: GDL(Gradient Difference Loss) 추가
     4. [수정 v5.6]: Autocast 조건을 use_amp 파라미터 기반으로 변경 (BF16 지원)
+    5. [NEW v5.11]: Charbonnier(L1) Loss 추가
     
     Args:
         gdl_loss_fn: GradientDifferenceLoss 인스턴스 (None이면 비활성화)
         gdl_weight: GDL loss 가중치 (0이면 비활성화)
+        l1_loss_fn: CharbonnierLoss 인스턴스 (None이면 비활성화)
+        l1_weight: L1 loss 가중치 (0이면 비활성화)
         use_amp: AMP 사용 여부 (BF16 또는 FP16)
         autocast_dtype: Autocast dtype (torch.bfloat16 or torch.float16)
     """
@@ -208,7 +213,8 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     recon_losses = []
     kl_losses = []
     lpips_losses = []
-    gdl_losses = []  # [추가] GDL loss 추적
+    gdl_losses = []
+    l1_losses = []  # [NEW v5.11] L1 loss 추적
     
     from losses.losses import StableKLLoss
     kl_loss_fn = StableKLLoss(free_bits=config['vae'].get('free_bits', 0.0))
@@ -225,6 +231,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
         logger.info(f"VAE training config:")
         logger.info(f"  - Config mid_slice_weight: {config_mid_weight} (IGNORED for VAE)")
         logger.info(f"  - Actual mid_weight: Equal (1/3 for all slices)")
+        logger.info(f"  - L1 (Charbonnier) weight: {l1_weight}")  # [NEW v5.11]
         logger.info(f"  - GDL weight: {gdl_weight}")
         logger.info(f"  - LPIPS weight: {lpips_weight}")
         logger.info(f"  - AMP enabled: {use_amp}")
@@ -294,7 +301,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                     logger.warning(f"NaN/Inf in logvar at batch {i}")
                     continue
                 
-                # [수정 v5.5]: Reconstruction loss with 균등 가중치
+                # [수정 v5.5]: Reconstruction loss (MSE) with 균등 가중치
                 recon_loss = compute_3d_loss(recon, ct_volume, mid_weight=current_mid_weight)
                 recon_loss = torch.maximum(recon_loss, torch.tensor(1e-6, device=device))
                 
@@ -303,6 +310,18 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                 
                 # Initialize total loss
                 loss = recon_loss + beta * kl_loss
+                
+                # ============================================================
+                # [NEW v5.11]: Charbonnier(L1) Loss 추가 (균등 가중치)
+                # ============================================================
+                if l1_loss_fn is not None and l1_weight > 0:
+                    l1_loss = compute_slicewise_weighted_loss(
+                        recon, ct_volume, l1_loss_fn, mid_weight=current_mid_weight
+                    )
+                    loss = loss + l1_weight * l1_loss
+                    l1_losses.append(l1_loss.item())
+                else:
+                    l1_losses.append(0.0)
                 
                 # [수정 v5.5]: GDL Loss 추가 (균등 가중치)
                 if gdl_loss_fn is not None and gdl_weight > 0:
@@ -388,6 +407,7 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
             'loss': actual_loss,
             'recon': recon_loss.item(),
             'kl': kl_loss.item(),
+            'l1': l1_losses[-1] if l1_losses else 0.0,  # [NEW v5.11]
             'gdl': gdl_losses[-1] if gdl_losses else 0.0,
             'beta': beta,
             'lr': optimizer.param_groups[0]['lr'],
@@ -416,7 +436,8 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
     avg_recon = np.mean(recon_losses) if recon_losses else 0
     avg_kl = np.mean(kl_losses) if kl_losses else 0
     avg_lpips = np.mean(lpips_losses) if lpips_losses else 0
-    avg_gdl = np.mean(gdl_losses) if gdl_losses else 0  # [추가]
+    avg_gdl = np.mean(gdl_losses) if gdl_losses else 0
+    avg_l1 = np.mean(l1_losses) if l1_losses else 0  # [NEW v5.11]
     
     metrics_tracker.update('vae', train_loss=avg_loss, recon_loss=avg_recon, 
                           kl_loss=avg_kl, lpips_loss=avg_lpips)
@@ -424,13 +445,14 @@ def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, co
                             total_loss=avg_loss, 
                             recon_loss=avg_recon, 
                             kl_loss=avg_kl,
+                            l1_loss=avg_l1,  # [NEW v5.11]
                             lpips_loss=avg_lpips,
-                            gdl_loss=avg_gdl,  # [추가]
+                            gdl_loss=avg_gdl,
                             beta=beta,
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
                             skipped_steps=skipped_steps,
-                            mid_weight='equal',  # [추가] 균등 가중치 사용 로깅
+                            mid_weight='equal',
                             use_amp=use_amp,
                             autocast_dtype=str(autocast_dtype))
     

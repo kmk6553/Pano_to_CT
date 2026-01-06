@@ -15,6 +15,7 @@ FIXES APPLIED:
 7. [v5.9] Warmup steps config 우선 사용
 8. [v5.9] Self-conditioning 플래그 수정 (끌 수 있도록)
 9. [v5.9] 데이터 폴더 스캔 방식 개선 (실제 폴더 확인)
+10. [NEW v5.11] VAE 학습에 Charbonnier(L1) Loss 추가 (--vae_l1_weight)
 """
 
 import torch
@@ -222,6 +223,7 @@ def main(args):
                 'free_bits': 0.1,
                 'lpips_weight': args.vae_lpips_weight,
                 'gdl_weight': args.vae_gdl_weight,
+                'l1_weight': args.vae_l1_weight,  # [NEW v5.11] VAE L1 weight
                 'initial_lr': args.vae_lr,
                 'target_lr': max(args.vae_lr * 10, 0.0001),
                 'warmup_epochs': 5,
@@ -381,6 +383,7 @@ def main(args):
     logger.info(f"CFG dropout: {config['diffusion']['cfg_dropout_prob']}")
     logger.info(f"CFG guidance scale: {config['diffusion']['guidance_scale']}")
     logger.info(f"Mid-slice weight (Diffusion): {config['diffusion']['mid_slice_weight']}")
+    logger.info(f"VAE L1 (Charbonnier) weight: {config['vae'].get('l1_weight', 0.0)}")  # [NEW v5.11]
     logger.info(f"VAE GDL weight: {config['vae'].get('gdl_weight', 0.0)}")
     logger.info("="*60 + "\n")
     
@@ -602,6 +605,11 @@ def main(args):
         checkpoint = load_checkpoint(config['vae_checkpoint'], device)
         vae.load_state_dict(checkpoint['vae_state_dict'])
         logger.info("VAE checkpoint loaded successfully!")
+        
+        # [NEW v5.11] Resume epoch from VAE checkpoint
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            logger.info(f"Resuming VAE training from epoch {start_epoch}")
     
     if args.resume_from_checkpoint:
         logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
@@ -718,14 +726,17 @@ def main(args):
         logger.info("="*60)
         logger.info(f"Processing 3-slice windows: [B, 1, D=3, H, W]")
         logger.info(f"Slice weighting: EQUAL (1/3 for all slices)")
+        logger.info(f"L1 (Charbonnier) weight: {config['vae'].get('l1_weight', 0.0)}")  # [NEW v5.11]
         logger.info(f"GDL weight: {config['vae'].get('gdl_weight', 0.0)}")
         logger.info(f"LPIPS weight: {config['vae']['lpips_weight']}")
         logger.info(f"Total epochs: {config['training']['vae_epochs']}")
+        logger.info(f"Starting from epoch: {start_epoch}")
         logger.info(f"Batch size: {config['training']['batch_size']}")
         logger.info(f"Effective batch size: {config['training']['batch_size'] * accumulation_steps}")
         logger.info("="*60 + "\n")
         
         vae_gdl_weight = config['vae'].get('gdl_weight', 0.0)
+        vae_l1_weight = config['vae'].get('l1_weight', 0.0)  # [NEW v5.11]
         
         for epoch in range(start_epoch, config['training']['vae_epochs'] + 1):
             if hasattr(train_dataset, 'set_epoch'):
@@ -740,6 +751,8 @@ def main(args):
                 gpu_augmenter=gpu_augmenter,
                 gdl_loss_fn=gdl_loss_fn if vae_gdl_weight > 0 else None,
                 gdl_weight=vae_gdl_weight,
+                l1_loss_fn=l1_loss_fn if vae_l1_weight > 0 else None,  # [NEW v5.11]
+                l1_weight=vae_l1_weight,  # [NEW v5.11]
                 use_amp=use_amp_vae,
                 autocast_dtype=autocast_dtype
             )
@@ -1050,6 +1063,9 @@ if __name__ == '__main__':
     parser.add_argument('--vae_lpips_weight', type=float, default=0.1)
     parser.add_argument('--vae_gdl_weight', type=float, default=0.1,
                        help='GDL weight for VAE training (default: 0.1)')
+    # [NEW v5.11] VAE L1 (Charbonnier) weight
+    parser.add_argument('--vae_l1_weight', type=float, default=0.0,
+                       help='Charbonnier (L1) loss weight for VAE training (default: 0.0)')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=2,

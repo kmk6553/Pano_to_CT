@@ -131,7 +131,7 @@ class Upsample3D(nn.Module):
     def forward(self, x):
         # Upsample only H and W, keep D
         b, c, d, h, w = x.shape
-        x = F.interpolate(x, size=(d, h * 2, w * 2), mode='trilinear', align_corners=False)
+        x = F.interpolate(x, size=(d, h * 2, w * 2), mode='nearest')
         return self.conv(x)
 
 

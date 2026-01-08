@@ -1,6 +1,11 @@
 """
 Metrics tracking and visualization
+
+FIX: matplotlib 백엔드를 'Agg'로 설정하여 멀티스레드 환경에서 tkinter 충돌 방지
 """
+
+import matplotlib
+matplotlib.use('Agg')  # 반드시 pyplot import 전에! GUI 없이 파일 저장만 수행
 
 import numpy as np
 import matplotlib.pyplot as plt

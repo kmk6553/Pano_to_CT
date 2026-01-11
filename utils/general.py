@@ -1,5 +1,9 @@
 """
 General utility functions
+
+FIXES APPLIED:
+1. [v5.12] load_checkpoint - CPU로 먼저 로드 후 필요한 것만 GPU로 전송
+2. [v5.12] 명시적 메모리 해제 함수 추가
 """
 
 import torch
@@ -7,6 +11,7 @@ import numpy as np
 import random
 import os
 import logging
+import gc
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +62,90 @@ def check_gpu_support():
     return True, supports_bfloat16, gpu_name
 
 
-def load_checkpoint(path, device):
-    """Load checkpoint with backward compatibility"""
-    return torch.load(path, map_location=device, weights_only=False)
+def load_checkpoint(path, device=None):
+    """
+    Load checkpoint with memory-efficient loading
+    
+    [FIX v5.12] CPU로 먼저 로드하여 GPU 메모리 폭증 방지
+    
+    Args:
+        path: checkpoint file path
+        device: target device (deprecated, always loads to CPU first)
+    
+    Returns:
+        checkpoint dict (on CPU)
+    """
+    logger.info(f"Loading checkpoint from: {path}")
+    
+    # 항상 CPU로 먼저 로드 (GPU 메모리 절약)
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+    
+    logger.info(f"Checkpoint loaded to CPU successfully")
+    
+    return checkpoint
+
+
+def load_state_dict_to_model(model, state_dict, strict=True):
+    """
+    [v5.12] state_dict를 모델에 로드하고 원본 state_dict 메모리 해제
+    
+    Args:
+        model: target model (already on GPU)
+        state_dict: state dict from checkpoint (on CPU)
+        strict: whether to strictly enforce matching keys
+    
+    Returns:
+        None (모델에 직접 로드)
+    """
+    model.load_state_dict(state_dict, strict=strict)
+    
+    # state_dict 메모리 해제
+    del state_dict
+    gc.collect()
+
+
+def cleanup_checkpoint(checkpoint):
+    """
+    [v5.12] 체크포인트 딕셔너리 메모리 해제
+    
+    Args:
+        checkpoint: checkpoint dictionary to clean up
+    """
+    if checkpoint is None:
+        return
+    
+    # 모든 텐서 참조 해제
+    for key in list(checkpoint.keys()):
+        if isinstance(checkpoint[key], dict):
+            for sub_key in list(checkpoint[key].keys()):
+                del checkpoint[key][sub_key]
+        del checkpoint[key]
+    
+    del checkpoint
+    gc.collect()
+    
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    logger.info("Checkpoint memory cleaned up")
+
+
+def log_gpu_memory(tag=""):
+    """
+    [v5.12] GPU 메모리 사용량 로깅
+    """
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+        logger.info(f"[GPU Memory {tag}] Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB, Max: {max_allocated:.2f}GB")
+
+
+def force_cuda_cleanup():
+    """
+    [v5.12] 강제 CUDA 메모리 정리
+    """
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()

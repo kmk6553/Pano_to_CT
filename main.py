@@ -16,6 +16,10 @@ FIXES APPLIED:
 8. [v5.9] Self-conditioning 플래그 수정 (끌 수 있도록)
 9. [v5.9] 데이터 폴더 스캔 방식 개선 (실제 폴더 확인)
 10. [NEW v5.11] VAE 학습에 Charbonnier(L1) Loss 추가 (--vae_l1_weight)
+11. [FIX v5.12] 체크포인트 로드 시 메모리 관리 개선
+    - CPU로 먼저 로드 후 필요한 state_dict만 GPU로 전송
+    - 로드 완료 후 체크포인트 딕셔너리 명시적 해제
+    - gc.collect() 및 torch.cuda.empty_cache() 호출
 """
 
 import torch
@@ -30,6 +34,7 @@ import os
 import random
 import argparse
 import logging
+import gc
 from datetime import datetime
 
 # Import our modules
@@ -53,6 +58,7 @@ from utils import (
     save_config,
     MetricsTracker
 )
+from utils.general import cleanup_checkpoint, log_gpu_memory, force_cuda_cleanup
 from diffusion_process import DiffusionProcess
 
 # Setup logging
@@ -94,6 +100,9 @@ def compute_latent_scale_factor(vae, dataloader, device, num_samples=100):
             mean, logvar = vae.encoder(ct_volume)
             z = mean
             latents.append(z.cpu())
+            
+            # 메모리 정리
+            del ct_volume, mean, logvar, z
     
     all_latents = torch.cat(latents, dim=0)
     latent_std = all_latents.std().item()
@@ -105,6 +114,10 @@ def compute_latent_scale_factor(vae, dataloader, device, num_samples=100):
     logger.info(f"  Mean: {all_latents.mean().item():.4f}")
     logger.info(f"  Std: {latent_std:.4f}")
     logger.info(f"  Scale factor (1/std): {scale_factor:.4f}")
+    
+    # 메모리 정리
+    del latents, all_latents
+    force_cuda_cleanup()
     
     return scale_factor
 
@@ -154,6 +167,116 @@ def scan_data_folders(data_dir, max_folders=500):
         logger.info(f"Last 5 folders: {valid_folders[-5:]}")
     
     return valid_folders
+
+
+def load_vae_checkpoint_efficient(vae, checkpoint_path, device):
+    """
+    [FIX v5.12] VAE 체크포인트를 메모리 효율적으로 로드
+    
+    Args:
+        vae: VAE model (on GPU)
+        checkpoint_path: path to checkpoint
+        device: target device
+    
+    Returns:
+        start_epoch: epoch to resume from
+        config: config from checkpoint (if any)
+    """
+    log_gpu_memory("Before VAE checkpoint load")
+    
+    # CPU로 로드
+    checkpoint = load_checkpoint(checkpoint_path)
+    
+    # VAE state dict만 추출하여 로드
+    if 'vae_state_dict' in checkpoint:
+        vae.load_state_dict(checkpoint['vae_state_dict'])
+        logger.info("VAE state dict loaded")
+    
+    # 필요한 정보 추출
+    start_epoch = checkpoint.get('epoch', 0) + 1
+    config = checkpoint.get('config', {})
+    
+    # 체크포인트 메모리 해제
+    cleanup_checkpoint(checkpoint)
+    
+    log_gpu_memory("After VAE checkpoint load + cleanup")
+    
+    return start_epoch, config
+
+
+def load_diffusion_checkpoint_efficient(diffusion_model, optimizer, scheduler, ema_wrapper, 
+                                        checkpoint_path, device):
+    """
+    [FIX v5.12] Diffusion 체크포인트를 메모리 효율적으로 로드
+    
+    Args:
+        diffusion_model: diffusion model (on GPU)
+        optimizer: optimizer
+        scheduler: learning rate scheduler
+        ema_wrapper: EMA wrapper (optional)
+        checkpoint_path: path to checkpoint
+        device: target device
+    
+    Returns:
+        start_epoch: epoch to resume from
+        nan_epochs: list of NaN epochs from checkpoint
+    """
+    log_gpu_memory("Before Diffusion checkpoint load")
+    
+    # CPU로 로드
+    checkpoint = load_checkpoint(checkpoint_path)
+    
+    # Diffusion model state dict 로드
+    if 'diffusion_state_dict' in checkpoint:
+        diffusion_model.load_state_dict(checkpoint['diffusion_state_dict'])
+        logger.info("Diffusion model state dict loaded")
+    
+    # EMA state dict 로드
+    if ema_wrapper is not None and 'ema_state_dict' in checkpoint:
+        ema_wrapper.get_model().load_state_dict(checkpoint['ema_state_dict'])
+        logger.info("EMA model state dict loaded")
+    
+    # Optimizer state dict 로드 (주의: 이것이 큰 메모리 차지)
+    if 'diffusion_optimizer' in checkpoint and optimizer is not None:
+        # Optimizer state를 CPU에서 로드 후 각 텐서를 개별적으로 GPU로 이동
+        opt_state = checkpoint['diffusion_optimizer']
+        
+        # state 내의 텐서들을 GPU로 이동
+        if 'state' in opt_state:
+            for param_id in opt_state['state']:
+                param_state = opt_state['state'][param_id]
+                for key in param_state:
+                    if isinstance(param_state[key], torch.Tensor):
+                        param_state[key] = param_state[key].to(device)
+        
+        optimizer.load_state_dict(opt_state)
+        logger.info("Diffusion optimizer state loaded")
+        
+        # opt_state 해제
+        del opt_state
+    
+    # Scheduler state dict 로드
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        if checkpoint['scheduler_state_dict'] is not None:
+            if hasattr(scheduler, 'load_state_dict'):
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            elif hasattr(scheduler, 'current_step'):
+                scheduler.current_step = checkpoint['scheduler_state_dict'].get('current_step', 0)
+            logger.info("Scheduler state loaded")
+    
+    # 필요한 정보 추출
+    start_epoch = checkpoint.get('epoch', 0) + 1
+    nan_epochs = checkpoint.get('nan_epochs', [])
+    
+    # 체크포인트 메모리 해제
+    cleanup_checkpoint(checkpoint)
+    
+    # 강제 메모리 정리
+    force_cuda_cleanup()
+    
+    log_gpu_memory("After Diffusion checkpoint load + cleanup")
+    
+    return start_epoch, nan_epochs
 
 
 def main(args):
@@ -303,6 +426,9 @@ def main(args):
         logger.info(f"CUDA Version: {torch.version.cuda}")
         logger.info(f"PyTorch Version: {torch.__version__}")
         
+        # [FIX v5.12] 초기 GPU 메모리 상태 로깅
+        log_gpu_memory("Initial")
+        
         if config['training']['use_bfloat16']:
             if supports_bfloat16:
                 logger.info("BFloat16 support detected! Using BFloat16 for improved numerical stability.")
@@ -368,6 +494,7 @@ def main(args):
     logger.info(f"- Augmentation starts from epoch: {config['data']['augment_from_epoch']}")
     logger.info(f"- Latent scale factor: {config['model']['scale_factor']}")
     logger.info(f"- Auto compute scale factor: {config['model'].get('auto_scale_factor', False)}")
+    logger.info(f"- [v5.12] Memory-efficient checkpoint loading: Enabled")
     logger.info("="*60 + "\n")
     
     # Log model configuration
@@ -416,8 +543,6 @@ def main(args):
     
     # ============================================================
     # [FIX v5.9] 데이터 폴더 스캔 방식 개선
-    # 기존: 하드코딩된 폴더명 생성 (실제 폴더 확인 안 함)
-    # 수정: 실제 존재하는 폴더만 스캔
     # ============================================================
     max_folders = config.get('max_data_folders', 500)
     all_folders = scan_data_folders(config['data']['data_dir'], max_folders)
@@ -449,6 +574,11 @@ def main(args):
     # Initialize metrics tracker
     metrics_tracker = MetricsTracker()
     
+    # ============================================================
+    # [FIX v5.12] 모델 생성 전 메모리 상태 로깅
+    # ============================================================
+    log_gpu_memory("Before model creation")
+    
     # Create 3D models
     logger.info("\nInitializing 3D models...")
     
@@ -460,6 +590,8 @@ def main(args):
     
     vae_params = sum(p.numel() for p in vae.parameters())
     logger.info(f"3D VAE parameters: {vae_params:,}")
+    
+    log_gpu_memory("After VAE creation")
     
     diffusion_model = ConditionalUNet3D(
         in_channels=config['model']['z_channels'], 
@@ -474,6 +606,8 @@ def main(args):
     diffusion_params = sum(p.numel() for p in diffusion_model.parameters())
     logger.info(f"3D Diffusion UNet parameters: {diffusion_params:,}")
     
+    log_gpu_memory("After Diffusion model creation")
+    
     consistency_net = ConsistencyNet3D(
         in_channels=1, 
         features=32, 
@@ -483,6 +617,8 @@ def main(args):
     consistency_params = sum(p.numel() for p in consistency_net.parameters())
     logger.info(f"Consistency Network parameters: {consistency_params:,}")
     logger.info(f"Total parameters: {vae_params + diffusion_params + consistency_params:,}")
+    
+    log_gpu_memory("After all models creation")
     
     # Setup EMA
     ema_wrapper = None
@@ -497,6 +633,8 @@ def main(args):
         
         ema_wrapper = EMAWrapper(diffusion_model, decay=ema_decay)
         logger.info(f"EMA enabled with decay={ema_decay}")
+        
+        log_gpu_memory("After EMA creation")
     
     # Create diffusion process
     diffusion_process = DiffusionProcess(
@@ -598,32 +736,50 @@ def main(args):
         stability_threshold=0.1
     ) if config['training']['use_scheduler'] else None
     
-    # Load checkpoints if provided
+    # ============================================================
+    # [FIX v5.12] 체크포인트 로드 - 메모리 효율적 방식
+    # ============================================================
     start_epoch = 1
+    
     if config.get('vae_checkpoint'):
-        logger.info(f"Loading VAE checkpoint from: {config['vae_checkpoint']}")
-        checkpoint = load_checkpoint(config['vae_checkpoint'], device)
-        vae.load_state_dict(checkpoint['vae_state_dict'])
+        logger.info(f"\n{'='*60}")
+        logger.info("Loading VAE checkpoint (memory-efficient)")
+        logger.info(f"{'='*60}")
+        
+        vae_start_epoch, vae_config = load_vae_checkpoint_efficient(
+            vae, config['vae_checkpoint'], device
+        )
+        
         logger.info("VAE checkpoint loaded successfully!")
         
-        # [NEW v5.11] Resume epoch from VAE checkpoint
-        if 'epoch' in checkpoint:
-            start_epoch = checkpoint['epoch'] + 1
-            logger.info(f"Resuming VAE training from epoch {start_epoch}")
+        # scale_factor를 checkpoint config에서 가져오기
+        if vae_config and 'model' in vae_config and 'scale_factor' in vae_config['model']:
+            loaded_scale_factor = vae_config['model']['scale_factor']
+            if loaded_scale_factor != config['model']['scale_factor']:
+                logger.info(f"Using scale_factor from VAE checkpoint: {loaded_scale_factor}")
+                config['model']['scale_factor'] = loaded_scale_factor
     
     if args.resume_from_checkpoint:
-        logger.info(f"Resuming from checkpoint: {args.resume_from_checkpoint}")
-        checkpoint = load_checkpoint(args.resume_from_checkpoint, device)
+        logger.info(f"\n{'='*60}")
+        logger.info("Resuming from full checkpoint (memory-efficient)")
+        logger.info(f"{'='*60}")
+        
+        # CPU로 로드
+        checkpoint = load_checkpoint(args.resume_from_checkpoint)
         
         vae.load_state_dict(checkpoint['vae_state_dict'])
+        logger.info("VAE state loaded")
         
         if 'optimizer_state_dict' in checkpoint:
             vae_optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            logger.info("Restored optimizer state")
+            logger.info("VAE optimizer state loaded")
         
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch'] + 1
             logger.info(f"Resuming from epoch {start_epoch}")
+        
+        # 체크포인트 메모리 해제
+        cleanup_checkpoint(checkpoint)
         
         if start_epoch > config['training']['vae_epochs']:
             logger.info(f"VAE training already completed")
@@ -633,48 +789,20 @@ def main(args):
     diffusion_start_epoch = 1
     nan_epochs = []
     
-    # Load diffusion checkpoint if provided
-    if config.get('resume_diffusion_from'):
-        logger.info(f"Loading diffusion checkpoint from: {config['resume_diffusion_from']}")
-        diffusion_checkpoint = load_checkpoint(config['resume_diffusion_from'], device)
-        
-        if 'diffusion_state_dict' in diffusion_checkpoint:
-            diffusion_model.load_state_dict(diffusion_checkpoint['diffusion_state_dict'])
-            logger.info("Diffusion model state loaded")
-        
-        if 'ema_state_dict' in diffusion_checkpoint and ema_wrapper is not None:
-            ema_wrapper.get_model().load_state_dict(diffusion_checkpoint['ema_state_dict'])
-            logger.info("EMA model state loaded")
-        
-        if 'diffusion_optimizer' in diffusion_checkpoint:
-            diffusion_optimizer.load_state_dict(diffusion_checkpoint['diffusion_optimizer'])
-            logger.info("Diffusion optimizer state loaded")
-        
-        if 'epoch' in diffusion_checkpoint:
-            diffusion_start_epoch = diffusion_checkpoint['epoch'] + 1
-            logger.info(f"Resuming diffusion training from epoch {diffusion_start_epoch}")
-    
     # ============================================================
     # [FIX v5.9] Warmup steps - config 값 우선 사용
-    # 기존: min(5000, total_steps // 10) 하드코딩
-    # 수정: config['training']['warmup_steps'] 우선 사용
     # ============================================================
     steps_per_epoch = len(train_loader) // accumulation_steps
     total_steps = config['training']['diffusion_epochs'] * steps_per_epoch
     
-    if diffusion_start_epoch > 1:
-        warmup_steps = 0
-        completed_steps = (diffusion_start_epoch - 1) * steps_per_epoch
+    # Scheduler 먼저 생성 (checkpoint 로드 전)
+    config_warmup = config['training'].get('warmup_steps', None)
+    if config_warmup is not None:
+        warmup_steps = min(config_warmup, total_steps // 2)
+        logger.info(f"Using config warmup_steps: {config_warmup} -> {warmup_steps} (capped at total_steps/2)")
     else:
-        # Config 값 우선 사용, 없으면 기본값 계산
-        config_warmup = config['training'].get('warmup_steps', None)
-        if config_warmup is not None:
-            warmup_steps = min(config_warmup, total_steps // 2)
-            logger.info(f"Using config warmup_steps: {config_warmup} -> {warmup_steps} (capped at total_steps/2)")
-        else:
-            warmup_steps = min(5000, total_steps // 10)
-            logger.info(f"Using default warmup_steps: {warmup_steps}")
-        completed_steps = 0
+        warmup_steps = min(5000, total_steps // 10)
+        logger.info(f"Using default warmup_steps: {warmup_steps}")
     
     diffusion_scheduler = WarmupCosineScheduler(
         diffusion_optimizer, 
@@ -684,8 +812,30 @@ def main(args):
         base_lr=config['diffusion']['diffusion_lr']
     )
     
-    if diffusion_start_epoch > 1:
-        diffusion_scheduler.current_step = completed_steps
+    # ============================================================
+    # [FIX v5.12] Diffusion 체크포인트 로드 - 메모리 효율적 방식
+    # ============================================================
+    if config.get('resume_diffusion_from'):
+        logger.info(f"\n{'='*60}")
+        logger.info("Loading Diffusion checkpoint (memory-efficient)")
+        logger.info(f"{'='*60}")
+        
+        diffusion_start_epoch, nan_epochs = load_diffusion_checkpoint_efficient(
+            diffusion_model, 
+            diffusion_optimizer, 
+            diffusion_scheduler, 
+            ema_wrapper,
+            config['resume_diffusion_from'], 
+            device
+        )
+        
+        logger.info(f"Resuming diffusion training from epoch {diffusion_start_epoch}")
+        
+        # Warmup 조정
+        if diffusion_start_epoch > 1:
+            completed_steps = (diffusion_start_epoch - 1) * steps_per_epoch
+            diffusion_scheduler.current_step = completed_steps
+            logger.info(f"Scheduler current_step set to {completed_steps}")
     
     # Setup GradScaler for AMP
     scaler = None
@@ -717,6 +867,11 @@ def main(args):
     elif use_bf16:
         logger.info("Using BFloat16 - GradScaler not needed")
     
+    # ============================================================
+    # [FIX v5.12] 모든 초기화 완료 후 메모리 상태 로깅
+    # ============================================================
+    log_gpu_memory("After all initialization")
+    
     # =========================================================================
     # Training Phase 1: 3D VAE
     # =========================================================================
@@ -726,7 +881,7 @@ def main(args):
         logger.info("="*60)
         logger.info(f"Processing 3-slice windows: [B, 1, D=3, H, W]")
         logger.info(f"Slice weighting: EQUAL (1/3 for all slices)")
-        logger.info(f"L1 (Charbonnier) weight: {config['vae'].get('l1_weight', 0.0)}")  # [NEW v5.11]
+        logger.info(f"L1 (Charbonnier) weight: {config['vae'].get('l1_weight', 0.0)}")
         logger.info(f"GDL weight: {config['vae'].get('gdl_weight', 0.0)}")
         logger.info(f"LPIPS weight: {config['vae']['lpips_weight']}")
         logger.info(f"Total epochs: {config['training']['vae_epochs']}")
@@ -736,7 +891,7 @@ def main(args):
         logger.info("="*60 + "\n")
         
         vae_gdl_weight = config['vae'].get('gdl_weight', 0.0)
-        vae_l1_weight = config['vae'].get('l1_weight', 0.0)  # [NEW v5.11]
+        vae_l1_weight = config['vae'].get('l1_weight', 0.0)
         
         for epoch in range(start_epoch, config['training']['vae_epochs'] + 1):
             if hasattr(train_dataset, 'set_epoch'):
@@ -751,8 +906,8 @@ def main(args):
                 gpu_augmenter=gpu_augmenter,
                 gdl_loss_fn=gdl_loss_fn if vae_gdl_weight > 0 else None,
                 gdl_weight=vae_gdl_weight,
-                l1_loss_fn=l1_loss_fn if vae_l1_weight > 0 else None,  # [NEW v5.11]
-                l1_weight=vae_l1_weight,  # [NEW v5.11]
+                l1_loss_fn=l1_loss_fn if vae_l1_weight > 0 else None,
+                l1_weight=vae_l1_weight,
                 use_amp=use_amp_vae,
                 autocast_dtype=autocast_dtype
             )
@@ -765,9 +920,6 @@ def main(args):
                 continue
             
             if epoch % config['logging']['eval_interval'] == 0:
-                # ============================================================
-                # [v5.7 FIX] scale_factor 전달 추가
-                # ============================================================
                 evaluate_and_visualize(vae, None, None, val_loader, 
                                      device, epoch, os.path.join(save_dir, 'samples'), 
                                      'vae', metrics_tracker,
@@ -840,6 +992,9 @@ def main(args):
         logger.info(f"Resuming from epoch: {diffusion_start_epoch}")
     logger.info("="*60 + "\n")
     
+    # [FIX v5.12] Diffusion 학습 시작 전 메모리 상태 로깅
+    log_gpu_memory("Before diffusion training")
+    
     early_stop = False
     
     for epoch in range(diffusion_start_epoch, config['training']['diffusion_epochs'] + 1):
@@ -869,9 +1024,6 @@ def main(args):
             early_stop = True
         
         if epoch % config['logging']['eval_interval'] == 0:
-            # ============================================================
-            # [v5.7 FIX] scale_factor 전달 추가
-            # ============================================================
             evaluate_and_visualize(vae, diffusion_model, diffusion_process, 
                                  val_loader, device, epoch, 
                                  os.path.join(save_dir, 'samples'), 
@@ -889,7 +1041,7 @@ def main(args):
                 'diffusion_state_dict': diffusion_model.state_dict(),
                 'consistency_state_dict': consistency_net.state_dict(),
                 'diffusion_optimizer': diffusion_optimizer.state_dict(),
-                'scheduler_state_dict': diffusion_scheduler.state_dict() if hasattr(diffusion_scheduler, 'state_dict') else None,
+                'scheduler_state_dict': diffusion_scheduler.state_dict() if hasattr(diffusion_scheduler, 'state_dict') else {'current_step': diffusion_scheduler.current_step},
                 'metrics': metrics_tracker.metrics,
                 'config': config,
                 'nan_epochs': nan_epochs
@@ -1036,11 +1188,6 @@ if __name__ == '__main__':
                        choices=['v', 'epsilon', 'x0'],
                        help='Diffusion prediction type')
     
-    # ============================================================
-    # [FIX v5.9] Self-conditioning 플래그 수정
-    # 기존: action='store_true', default=True (끌 수 없음)
-    # 수정: default=False로 변경하고, 명시적으로 켜야 함
-    # ============================================================
     parser.add_argument('--use_self_conditioning', action='store_true', default=False,
                        help='Enable self-conditioning (default: False, add flag to enable)')
     parser.add_argument('--no_self_conditioning', action='store_true', default=False,
@@ -1063,7 +1210,6 @@ if __name__ == '__main__':
     parser.add_argument('--vae_lpips_weight', type=float, default=0.1)
     parser.add_argument('--vae_gdl_weight', type=float, default=0.1,
                        help='GDL weight for VAE training (default: 0.1)')
-    # [NEW v5.11] VAE L1 (Charbonnier) weight
     parser.add_argument('--vae_l1_weight', type=float, default=0.0,
                        help='Charbonnier (L1) loss weight for VAE training (default: 0.0)')
     
@@ -1122,10 +1268,7 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
-    # ============================================================
-    # [FIX v5.9] Self-conditioning 플래그 처리
-    # --no_self_conditioning이 명시되면 강제로 끔
-    # ============================================================
+    # Self-conditioning 플래그 처리
     if args.no_self_conditioning:
         args.use_self_conditioning = False
     

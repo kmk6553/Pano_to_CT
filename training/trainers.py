@@ -15,6 +15,10 @@ FIXES APPLIED:
 10. [FIX v5.8] CFG Dropout을 샘플별 독립 마스크로 변경 (배치 전체 일괄 적용 문제 수정)
 11. [FIX v5.9] x0_pred Latent Clamp 범위 확장: [-1, 1] -> [-3, 3] (고주파 정보 손실 방지)
 12. [NEW v5.11] VAE 학습에 Charbonnier(L1) Loss 추가
+13. [NEW v6.0] Foreground Mask 기반 가중치 손실 추가 (air 배경 지배 방지)
+14. [NEW v6.0] Image-space loss에 Timestep Gate 추가 (low-noise 구간에서만 적용)
+15. [NEW v6.0] MSE에 Foreground 가중치 옵션 추가
+16. [NEW v6.0] L1 가중치 Epoch별 Ramp 옵션 추가
 """
 
 import torch
@@ -181,6 +185,60 @@ def compute_slicewise_weighted_loss(pred, target, loss_fn, mid_weight=None):
         weighted_loss += w * slice_loss
     
     return weighted_loss / total_weight
+
+
+# ============================================================
+# [NEW v6.0] Foreground Mask 기반 가중치 손실 함수들
+# ============================================================
+
+def make_foreground_mask(ct_volume, air_threshold=-0.95, dilate_kernel=5):
+    """
+    CT 볼륨에서 foreground(치아/골/연조직) 마스크 생성
+    
+    치과 CT에서 air(-1)가 대부분을 차지하여 모델이 air 맞추기로 쉽게 loss를 줄이는 문제 방지
+    
+    Args:
+        ct_volume: [B, 1, D=3, H, W] in [-1, 1]
+        air_threshold: air로 간주할 임계값 (기본값 -0.95)
+        dilate_kernel: dilation kernel 크기 (경계 보완용, 0이나 None이면 비활성화)
+    
+    Returns:
+        mask: [B, 1, 3, H, W] float {0, 1} (dilated foreground mask)
+    """
+    # foreground: air(-1)보다 큰 영역
+    mask = (ct_volume > air_threshold).float()
+    
+    if dilate_kernel is not None and dilate_kernel > 1:
+        B, C, D, H, W = mask.shape
+        # slice-wise dilation in H, W
+        m2d = mask.permute(0, 2, 1, 3, 4).reshape(B * D, 1, H, W)  # [B*D, 1, H, W]
+        m2d = F.max_pool2d(m2d, kernel_size=dilate_kernel, stride=1, padding=dilate_kernel // 2)
+        mask = m2d.reshape(B, D, 1, H, W).permute(0, 2, 1, 3, 4)  # [B, 1, D, H, W]
+    
+    return mask
+
+
+def masked_charbonnier_loss_per_sample(pred, target, mask, epsilon=1e-2):
+    """
+    마스크 기반 Charbonnier loss를 샘플별로 계산
+    
+    Args:
+        pred: [B, C, H, W] - 예측 이미지
+        target: [B, C, H, W] - 타겟 이미지
+        mask: [B, C, H, W] - foreground mask (0 또는 1)
+        epsilon: Charbonnier epsilon
+    
+    Returns:
+        [B] - 샘플별 masked Charbonnier loss
+    """
+    diff = pred - target
+    loss_map = torch.sqrt(diff * diff + epsilon * epsilon) * mask
+    
+    # 샘플별로 합산 후 마스크 영역으로 정규화
+    denom = mask.sum(dim=(1, 2, 3)).clamp(min=1.0)
+    num = loss_map.sum(dim=(1, 2, 3))
+    
+    return num / denom
 
 
 def train_vae_optimized(vae, dataloader, optimizer, scheduler, device, epoch, config, metrics_tracker, 
@@ -484,6 +542,12 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     8. [FIX v5.9] x0_pred Latent Clamp 범위 확장: [-1, 1] -> [-3, 3]
        - 기존: torch.clamp(x0_pred, -1, 1) - 고주파 정보 손실
        - 수정: torch.clamp(x0_pred, -3, 3) - VAE latent 분포 보존
+    9. [NEW v6.0] Foreground Mask 기반 가중치 손실 추가
+       - air 배경이 손실을 지배하는 문제 해결
+    10. [NEW v6.0] Image-space loss에 Timestep Gate 추가
+        - low-noise 구간에서만 image-space loss 적용
+    11. [NEW v6.0] MSE에 Foreground 가중치 옵션 추가
+    12. [NEW v6.0] L1 가중치 Epoch별 Ramp 옵션 추가
     """
     diffusion_model.train()
     vae.eval()
@@ -515,6 +579,36 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
     use_stochastic_encoding = config['diffusion'].get('use_stochastic_encoding', False)
     encoding_type = "stochastic (sample)" if use_stochastic_encoding else "deterministic (mean)"
     
+    # ============================================================
+    # [NEW v6.0] Foreground Mask 설정
+    # ============================================================
+    use_foreground_mask = config['diffusion'].get('use_foreground_mask', True)
+    air_threshold = config['diffusion'].get('air_threshold', -0.95)
+    mask_dilate_kernel = config['diffusion'].get('mask_dilate_kernel', 5)
+    
+    # ============================================================
+    # [NEW v6.0] Timestep Gate 설정 (image-space loss는 low-noise에서만)
+    # ============================================================
+    use_timestep_gate = config['diffusion'].get('use_timestep_gate', True)
+    img_loss_t_max_frac = config['diffusion'].get('img_loss_t_max_frac', 0.2)  # 0.1~0.3 추천
+    t_max_for_img_loss = int(diffusion_process.num_timesteps * img_loss_t_max_frac)
+    
+    # ============================================================
+    # [NEW v6.0] MSE Foreground 가중치 설정 (선택 사항)
+    # ============================================================
+    use_foreground_mse = config['diffusion'].get('use_foreground_mse', False)
+    foreground_weight = config['diffusion'].get('foreground_weight', 3.0)  # 2~5 추천
+    
+    # ============================================================
+    # [NEW v6.0] L1 가중치 Ramp 설정 (선택 사항)
+    # ============================================================
+    l1_ramp_epochs = config['diffusion'].get('l1_ramp_epochs', 0)  # 0이면 비활성화
+    if l1_ramp_epochs > 0:
+        ramp_ratio = min(1.0, epoch / max(1, l1_ramp_epochs))
+        effective_l1_weight = l1_weight * ramp_ratio
+    else:
+        effective_l1_weight = l1_weight
+    
     # Log only on first epoch
     if epoch == 1:
         logger.info(f"Diffusion training config:")
@@ -525,8 +619,23 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         logger.info(f"  - MSE loss: uniform weighting (for z-continuity)")
         logger.info(f"  - [FIX v5.8] CFG Dropout: Per-sample independent masking")
         logger.info(f"  - [FIX v5.9] x0_pred clamp: [-{latent_clamp_range}, {latent_clamp_range}]")
+        logger.info(f"  - [NEW v6.0] Foreground Mask: {use_foreground_mask}")
+        if use_foreground_mask:
+            logger.info(f"      - Air threshold: {air_threshold}")
+            logger.info(f"      - Dilate kernel: {mask_dilate_kernel}")
+        logger.info(f"  - [NEW v6.0] Timestep Gate: {use_timestep_gate}")
+        if use_timestep_gate:
+            logger.info(f"      - t_max_frac: {img_loss_t_max_frac} (t < {t_max_for_img_loss})")
+        logger.info(f"  - [NEW v6.0] Foreground MSE: {use_foreground_mse}")
+        if use_foreground_mse:
+            logger.info(f"      - Foreground weight: {foreground_weight}")
+        logger.info(f"  - [NEW v6.0] L1 Ramp: {l1_ramp_epochs} epochs")
         if not use_stochastic_encoding:
             logger.info(f"    (Using z=mean for better structural accuracy)")
+    
+    # Log L1 ramp progress
+    if l1_ramp_epochs > 0 and epoch <= l1_ramp_epochs:
+        logger.info(f"  L1 weight ramp: {effective_l1_weight:.4f} (epoch {epoch}/{l1_ramp_epochs})")
     
     # MSE threshold for warnings
     high_mse_threshold = 1.2
@@ -600,6 +709,14 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         noisy_z = diffusion_process.q_sample(z, t, noise)
         
         # ============================================================
+        # [NEW v6.0] Timestep Gate 생성 (image-space loss용)
+        # ============================================================
+        if use_timestep_gate:
+            img_gate = (t < t_max_for_img_loss).float()  # [B]
+        else:
+            img_gate = torch.ones(batch_size, device=device)  # 항상 1
+        
+        # ============================================================
         # [FIX v5.8] CFG Dropout - 샘플별 독립 마스크 생성
         # 기존: np.random.rand() < cfg_dropout_prob (배치 전체 일괄 적용)
         # 수정: 각 샘플별로 독립적인 dropout 마스크 생성
@@ -645,8 +762,22 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                 else:
                     raise ValueError(f"Unknown prediction type: {diffusion_process.prediction_type}")
                 
-                # MSE loss: UNIFORM weighting (not mid_weight)
-                mse_loss = F.mse_loss(model_output, target)
+                # ============================================================
+                # [NEW v6.0] MSE loss with optional Foreground 가중치
+                # ============================================================
+                if use_foreground_mse:
+                    # fg mask를 latent 해상도로 downsample
+                    fg_mask = make_foreground_mask(ct_volume, air_threshold=air_threshold, 
+                                                   dilate_kernel=mask_dilate_kernel)  # [B,1,3,H,W]
+                    fg_lat = F.interpolate(fg_mask, size=z.shape[2:], mode='nearest')  # [B,1,3,h,w]
+                    fg_lat = fg_lat.expand(-1, z.shape[1], -1, -1, -1)  # [B,C,3,h,w]
+                    
+                    w_map = 1.0 + foreground_weight * fg_lat
+                    mse_map = (model_output - target) ** 2
+                    mse_loss = (mse_map * w_map).sum() / w_map.sum().clamp(min=1.0)
+                else:
+                    # MSE loss: UNIFORM weighting (not mid_weight)
+                    mse_loss = F.mse_loss(model_output, target)
                 
                 # Warning for high MSE
                 if epoch > ignore_epochs and mse_loss.item() > high_mse_threshold:
@@ -690,33 +821,80 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                     optimizer.zero_grad()
                     continue
                 
-                # Image-space 보조 loss에 mid_weight 적용
+                # ============================================================
+                # [NEW v6.0] Foreground Mask 생성 (image-space loss용)
+                # ============================================================
+                if use_foreground_mask:
+                    fg_mask = make_foreground_mask(ct_volume, air_threshold=air_threshold, 
+                                                   dilate_kernel=mask_dilate_kernel)  # [B,1,3,H,W]
+                else:
+                    fg_mask = None
                 
-                # L1 Loss with mid_weight
-                if l1_weight > 0:
-                    l1_loss = compute_slicewise_weighted_loss(
-                        decoded_pred, ct_volume, l1_loss_fn, mid_weight=mid_weight
-                    )
+                # ============================================================
+                # [NEW v6.0] Image-space loss: Foreground-masked + Slice-weighted + Timestep-gated
+                # ============================================================
+                
+                # L1 Loss with foreground mask, mid_weight, and timestep gate
+                if effective_l1_weight > 0:
+                    if use_foreground_mask and fg_mask is not None:
+                        # Foreground-masked + slice-weighted L1
+                        side_weight = (1 - mid_weight) / 2
+                        slice_weights = [side_weight, mid_weight, side_weight]
+                        total_w = sum(slice_weights)
+                        
+                        eps = getattr(l1_loss_fn, 'epsilon', 1e-2)
+                        
+                        per_sample_l1 = torch.zeros(batch_size, device=device)
+                        for si, w in enumerate(slice_weights):
+                            pred_s = decoded_pred[:, :, si, :, :]  # [B,1,H,W]
+                            tgt_s = ct_volume[:, :, si, :, :]
+                            m_s = fg_mask[:, :, si, :, :]
+                            # per-sample masked charbonnier
+                            l = masked_charbonnier_loss_per_sample(pred_s, tgt_s, m_s, epsilon=eps)  # [B]
+                            per_sample_l1 = per_sample_l1 + w * l
+                        
+                        per_sample_l1 = per_sample_l1 / total_w  # [B]
+                        
+                        # Apply timestep gate
+                        if use_timestep_gate:
+                            denom = img_gate.sum().clamp(min=1.0)
+                            l1_loss = (per_sample_l1 * img_gate).sum() / denom
+                        else:
+                            l1_loss = per_sample_l1.mean()
+                    else:
+                        # Original: slice-weighted L1 (no mask)
+                        l1_loss = compute_slicewise_weighted_loss(
+                            decoded_pred, ct_volume, l1_loss_fn, mid_weight=mid_weight
+                        )
+                        # Apply timestep gate (배치 평균에 gate 적용)
+                        if use_timestep_gate:
+                            l1_loss = l1_loss * (img_gate.sum() / batch_size)
                 else:
                     l1_loss = torch.tensor(0.0, device=device)
                 
-                # GDL Loss with mid_weight
+                # GDL Loss with mid_weight and timestep gate
                 if gdl_weight > 0:
                     gdl_loss = compute_slicewise_weighted_loss(
                         decoded_pred, ct_volume, gdl_loss_fn, mid_weight=mid_weight
                     )
+                    # Apply timestep gate
+                    if use_timestep_gate:
+                        gdl_loss = gdl_loss * (img_gate.sum() / batch_size)
                 else:
                     gdl_loss = torch.tensor(0.0, device=device)
                 
-                # LPIPS Loss with mid_weight
+                # LPIPS Loss with mid_weight and timestep gate
                 if lpips_weight > 0:
                     lpips_loss = compute_slicewise_weighted_loss(
                         decoded_pred, ct_volume, lpips_loss_fn, mid_weight=mid_weight
                     )
+                    # Apply timestep gate
+                    if use_timestep_gate:
+                        lpips_loss = lpips_loss * (img_gate.sum() / batch_size)
                 else:
                     lpips_loss = torch.tensor(0.0, device=device)
                 
-                loss = mse_loss + l1_weight * l1_loss + gdl_weight * gdl_loss + lpips_weight * lpips_loss
+                loss = mse_loss + effective_l1_weight * l1_loss + gdl_weight * gdl_loss + lpips_weight * lpips_loss
                 
                 if torch.isnan(loss) or torch.isinf(loss):
                     logger.warning(f"NaN/Inf in loss at batch {i}")
@@ -783,14 +961,14 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
         actual_loss = loss.item() * accumulation_steps
         total_loss += actual_loss
         mse_losses.append(mse_loss.item())
-        l1_losses.append(l1_loss.item() if l1_weight > 0 else 0.0)
+        l1_losses.append(l1_loss.item() if effective_l1_weight > 0 else 0.0)
         gdl_losses.append(gdl_loss.item() if gdl_weight > 0 else 0.0)
         lpips_losses.append(lpips_loss.item() if lpips_weight > 0 else 0.0)
         
         pbar.set_postfix({
             'loss': actual_loss,
             'mse': mse_loss.item(),
-            'l1': l1_loss.item() if l1_weight > 0 else 0.0,
+            'l1': l1_loss.item() if effective_l1_weight > 0 else 0.0,
             'gdl': gdl_loss.item() if gdl_weight > 0 else 0.0,
             'lpips': lpips_loss.item() if lpips_weight > 0 else 0.0,
             'pred': diffusion_process.prediction_type[:3],
@@ -851,6 +1029,9 @@ def train_diffusion_optimized(diffusion_model, vae, diffusion_process, dataloade
                             mid_weight=mid_weight,
                             latent_clamp_range=latent_clamp_range,
                             cfg_dropout='per_sample',  # [FIX v5.8] 로깅
+                            use_foreground_mask=use_foreground_mask,  # [NEW v6.0]
+                            use_timestep_gate=use_timestep_gate,  # [NEW v6.0]
+                            effective_l1_weight=effective_l1_weight,  # [NEW v6.0]
                             lr=optimizer.param_groups[0]['lr'],
                             overflow_count=gradient_overflow_count,
                             nan_count=nan_count,

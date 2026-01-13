@@ -20,6 +20,11 @@ FIXES APPLIED:
     - CPU로 먼저 로드 후 필요한 state_dict만 GPU로 전송
     - 로드 완료 후 체크포인트 딕셔너리 명시적 해제
     - gc.collect() 및 torch.cuda.empty_cache() 호출
+12. [NEW v6.0] Foreground Mask 기반 가중치 손실 추가
+13. [NEW v6.0] Image-space loss에 Timestep Gate 추가
+14. [NEW v6.0] MSE에 Foreground 가중치 옵션 추가
+15. [NEW v6.0] L1 가중치 Epoch별 Ramp 옵션 추가
+16. [NEW v6.0] Condition Concat 입력 옵션 추가
 """
 
 import torch
@@ -336,7 +341,32 @@ def main(args):
                 'lpips_weight': args.lpips_weight,
                 'diffusion_lr': args.diffusion_lr,
                 'use_stochastic_encoding': args.use_stochastic_encoding,
-                'mid_slice_weight': args.mid_slice_weight
+                'mid_slice_weight': args.mid_slice_weight,
+                # ============================================================
+                # [NEW v6.0] Foreground Mask 설정
+                # ============================================================
+                'use_foreground_mask': args.use_foreground_mask,
+                'air_threshold': args.air_threshold,
+                'mask_dilate_kernel': args.mask_dilate_kernel,
+                # ============================================================
+                # [NEW v6.0] Timestep Gate 설정
+                # ============================================================
+                'use_timestep_gate': args.use_timestep_gate,
+                'img_loss_t_max_frac': args.img_loss_t_max_frac,
+                # ============================================================
+                # [NEW v6.0] MSE Foreground 가중치 설정
+                # ============================================================
+                'use_foreground_mse': args.use_foreground_mse,
+                'foreground_weight': args.foreground_weight,
+                # ============================================================
+                # [NEW v6.0] L1 Ramp 설정
+                # ============================================================
+                'l1_ramp_epochs': args.l1_ramp_epochs,
+                # ============================================================
+                # [NEW v6.0] Condition Concat 설정
+                # ============================================================
+                'use_cond_concat': args.use_cond_concat,
+                'cond_concat_channels': args.cond_concat_channels,
             },
             'vae': {
                 'beta_max': 0.0001,
@@ -497,6 +527,28 @@ def main(args):
     logger.info(f"- [v5.12] Memory-efficient checkpoint loading: Enabled")
     logger.info("="*60 + "\n")
     
+    # ============================================================
+    # [NEW v6.0] 새로운 설정들 로깅
+    # ============================================================
+    logger.info("\n" + "="*60)
+    logger.info("[NEW v6.0] ADVANCED TRAINING OPTIONS:")
+    logger.info("="*60)
+    logger.info(f"- Foreground Mask: {config['diffusion'].get('use_foreground_mask', True)}")
+    if config['diffusion'].get('use_foreground_mask', True):
+        logger.info(f"    - Air threshold: {config['diffusion'].get('air_threshold', -0.95)}")
+        logger.info(f"    - Dilate kernel: {config['diffusion'].get('mask_dilate_kernel', 5)}")
+    logger.info(f"- Timestep Gate: {config['diffusion'].get('use_timestep_gate', True)}")
+    if config['diffusion'].get('use_timestep_gate', True):
+        logger.info(f"    - t_max_frac: {config['diffusion'].get('img_loss_t_max_frac', 0.2)}")
+    logger.info(f"- Foreground MSE: {config['diffusion'].get('use_foreground_mse', False)}")
+    if config['diffusion'].get('use_foreground_mse', False):
+        logger.info(f"    - Foreground weight: {config['diffusion'].get('foreground_weight', 3.0)}")
+    logger.info(f"- L1 Ramp: {config['diffusion'].get('l1_ramp_epochs', 0)} epochs")
+    logger.info(f"- Condition Concat: {config['diffusion'].get('use_cond_concat', False)}")
+    if config['diffusion'].get('use_cond_concat', False):
+        logger.info(f"    - Concat channels: {config['diffusion'].get('cond_concat_channels', None)}")
+    logger.info("="*60 + "\n")
+    
     # Log model configuration
     logger.info("\n" + "="*60)
     logger.info("MODEL CONFIGURATION:")
@@ -593,6 +645,12 @@ def main(args):
     
     log_gpu_memory("After VAE creation")
     
+    # ============================================================
+    # [NEW v6.0] Condition Concat 설정 전달
+    # ============================================================
+    use_cond_concat = config['diffusion'].get('use_cond_concat', False)
+    cond_concat_channels = config['diffusion'].get('cond_concat_channels', None)
+    
     diffusion_model = ConditionalUNet3D(
         in_channels=config['model']['z_channels'], 
         out_channels=config['model']['z_channels'],
@@ -600,11 +658,15 @@ def main(args):
         cond_channels=config['model']['cond_channels'],
         panorama_type=config['data']['panorama_type'],
         pano_triplet=True,
-        use_self_conditioning=config['diffusion']['use_self_conditioning']
+        use_self_conditioning=config['diffusion']['use_self_conditioning'],
+        use_cond_concat=use_cond_concat,  # [NEW v6.0]
+        cond_concat_channels=cond_concat_channels  # [NEW v6.0]
     ).to(device)
     
     diffusion_params = sum(p.numel() for p in diffusion_model.parameters())
     logger.info(f"3D Diffusion UNet parameters: {diffusion_params:,}")
+    if use_cond_concat:
+        logger.info(f"  [NEW v6.0] Condition Concat enabled with {cond_concat_channels or config['model']['z_channels']} channels")
     
     log_gpu_memory("After Diffusion model creation")
     
@@ -988,6 +1050,14 @@ def main(args):
     logger.info(f"Latent scale factor: {config['model']['scale_factor']}")
     logger.info(f"Warmup steps: {warmup_steps}")
     logger.info(f"Total epochs: {config['training']['diffusion_epochs']}")
+    # ============================================================
+    # [NEW v6.0] 새로운 설정들 로깅
+    # ============================================================
+    logger.info(f"[NEW v6.0] Foreground Mask: {config['diffusion'].get('use_foreground_mask', True)}")
+    logger.info(f"[NEW v6.0] Timestep Gate: {config['diffusion'].get('use_timestep_gate', True)}")
+    logger.info(f"[NEW v6.0] Foreground MSE: {config['diffusion'].get('use_foreground_mse', False)}")
+    logger.info(f"[NEW v6.0] L1 Ramp: {config['diffusion'].get('l1_ramp_epochs', 0)} epochs")
+    logger.info(f"[NEW v6.0] Condition Concat: {config['diffusion'].get('use_cond_concat', False)}")
     if diffusion_start_epoch > 1:
         logger.info(f"Resuming from epoch: {diffusion_start_epoch}")
     logger.info("="*60 + "\n")
@@ -1206,6 +1276,50 @@ if __name__ == '__main__':
                        help='Weight for middle slice in 3D loss (0.33=equal, 0.5=mid focused). '
                             'Note: VAE training always uses equal weighting.')
     
+    # ============================================================
+    # [NEW v6.0] Foreground Mask 인자
+    # ============================================================
+    parser.add_argument('--use_foreground_mask', action='store_true', default=True,
+                       help='Use foreground mask for L1 loss (default: True)')
+    parser.add_argument('--no_foreground_mask', action='store_true', default=False,
+                       help='Disable foreground mask')
+    parser.add_argument('--air_threshold', type=float, default=-0.95,
+                       help='Air threshold for foreground mask (default: -0.95)')
+    parser.add_argument('--mask_dilate_kernel', type=int, default=5,
+                       help='Dilation kernel size for foreground mask (default: 5)')
+    
+    # ============================================================
+    # [NEW v6.0] Timestep Gate 인자
+    # ============================================================
+    parser.add_argument('--use_timestep_gate', action='store_true', default=True,
+                       help='Use timestep gate for image-space loss (default: True)')
+    parser.add_argument('--no_timestep_gate', action='store_true', default=False,
+                       help='Disable timestep gate')
+    parser.add_argument('--img_loss_t_max_frac', type=float, default=0.2,
+                       help='Image-space loss only applied when t < num_timesteps * t_max_frac (default: 0.2)')
+    
+    # ============================================================
+    # [NEW v6.0] MSE Foreground 가중치 인자
+    # ============================================================
+    parser.add_argument('--use_foreground_mse', action='store_true', default=False,
+                       help='Apply foreground weighting to MSE loss (default: False)')
+    parser.add_argument('--foreground_weight', type=float, default=3.0,
+                       help='Foreground weight for MSE loss (default: 3.0, range 2~5)')
+    
+    # ============================================================
+    # [NEW v6.0] L1 Ramp 인자
+    # ============================================================
+    parser.add_argument('--l1_ramp_epochs', type=int, default=0,
+                       help='Ramp L1 weight from 0 to target over this many epochs (default: 0 = no ramp)')
+    
+    # ============================================================
+    # [NEW v6.0] Condition Concat 인자
+    # ============================================================
+    parser.add_argument('--use_cond_concat', action='store_true', default=False,
+                       help='Concat condition to input channels (stronger conditioning)')
+    parser.add_argument('--cond_concat_channels', type=int, default=None,
+                       help='Number of channels for condition concat (default: z_channels)')
+    
     # VAE specific
     parser.add_argument('--vae_lpips_weight', type=float, default=0.1)
     parser.add_argument('--vae_gdl_weight', type=float, default=0.1,
@@ -1271,5 +1385,14 @@ if __name__ == '__main__':
     # Self-conditioning 플래그 처리
     if args.no_self_conditioning:
         args.use_self_conditioning = False
+    
+    # ============================================================
+    # [NEW v6.0] 플래그 처리
+    # ============================================================
+    if args.no_foreground_mask:
+        args.use_foreground_mask = False
+    
+    if args.no_timestep_gate:
+        args.use_timestep_gate = False
     
     main(args)

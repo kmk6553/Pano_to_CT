@@ -5,6 +5,9 @@ Processes 3D latent volumes [B, C, D=3, h, w]
 FIXES APPLIED:
 1. ConditionEncoder3D - 가운데 슬라이드만 사용하는 대신 3장 슬라이드 평균(Mean) 사용
 2. AttentionBlock3D를 middle blocks에 추가하여 Z-axis consistency 향상
+3. [NEW v6.0] Condition Latent Concat 옵션 추가 - conditioning 무시 방지
+   - use_cond_concat=True로 condition을 입력 채널에 직접 concat
+   - UNet이 첫 레이어부터 condition을 "같이 보고" 시작하여 조건 무시가 어려워짐
 """
 
 import torch
@@ -198,6 +201,7 @@ class ConditionEncoder3D(nn.Module):
             # Level 0: Original resolution
             nn.Sequential(
                 nn.Conv2d(1, base_channels, kernel_size=3, padding=1),
+                nn.GroupNorm(32, base_channels),
                 nn.SiLU(),
                 nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, padding=1),
                 nn.GroupNorm(32, base_channels * 2),
@@ -300,18 +304,54 @@ class ConditionalUNet3D(nn.Module):
     Uses multi-scale spatial conditioning and position embedding
     
     UPDATED: Added AttentionBlock3D to middle blocks for improved Z-axis consistency
+    
+    [NEW v6.0] Condition Latent Concat 옵션 추가:
+    - use_cond_concat=True: condition을 latent 해상도로 내려서 입력 채널에 직접 concat
+    - 이렇게 하면 UNet이 첫 레이어부터 condition을 "같이 보고" 시작
+    - 기존 feature add(injector) 방식은 학습이 꼬이면 조건 무시 경로가 생길 수 있음
     """
     def __init__(self, in_channels=8, out_channels=8, channels=128, 
                  channel_multipliers=(1, 2, 4, 8), cond_channels=512, 
-                 panorama_type='axial', pano_triplet=True, use_self_conditioning=True):
+                 panorama_type='axial', pano_triplet=True, use_self_conditioning=True,
+                 use_cond_concat=False, cond_concat_channels=None):
+        """
+        Args:
+            in_channels: Input latent channels (z_channels)
+            out_channels: Output channels (same as in_channels)
+            channels: Base channel count
+            channel_multipliers: Channel multipliers for each level
+            cond_channels: Condition feature channels
+            panorama_type: Type of panorama extraction
+            pano_triplet: Whether condition is 3-slice triplet
+            use_self_conditioning: Enable self-conditioning
+            use_cond_concat: [NEW v6.0] Enable condition concat to input
+            cond_concat_channels: [NEW v6.0] Channels for condition concat (default: in_channels)
+        """
         super().__init__()
         
         self.panorama_type = panorama_type
         self.pano_triplet = pano_triplet
         self.use_self_conditioning = use_self_conditioning
         
+        # ============================================================
+        # [NEW v6.0] Condition Concat 설정
+        # ============================================================
+        self.use_cond_concat = use_cond_concat
+        self.cond_concat_channels = cond_concat_channels if cond_concat_channels is not None else in_channels
+        
         # Self-conditioning: double input channels
         actual_in_channels = in_channels * 2 if use_self_conditioning else in_channels
+        
+        # [NEW v6.0] Condition concat: add cond_concat_channels
+        if self.use_cond_concat:
+            # Condition을 latent 해상도로 변환하는 모듈
+            # cond: [B, 1, 3, H, W] -> [B, cond_concat_channels, 3, h, w]
+            self.cond_to_latent = nn.Sequential(
+                nn.Conv3d(1, self.cond_concat_channels, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv3d(self.cond_concat_channels, self.cond_concat_channels, kernel_size=3, padding=1),
+            )
+            actual_in_channels += self.cond_concat_channels
         
         # Time embedding
         time_dim = channels * 4
@@ -446,6 +486,49 @@ class ConditionalUNet3D(nn.Module):
                 x_self_cond = torch.zeros_like(x)
             x = torch.cat([x, x_self_cond], dim=1)
         
+        # ============================================================
+        # [NEW v6.0] Condition Concat 처리
+        # condition을 latent 해상도로 변환하여 입력 채널에 직접 concat
+        # ============================================================
+        if self.use_cond_concat:
+            # cond: [B, 3, H, W] -> [B, 1, 3, H, W]
+            if cond.dim() == 4:
+                cond_3d = cond.unsqueeze(1)  # [B, 1, 3, H, W]
+            else:
+                cond_3d = cond  # 이미 [B, 1, 3, H, W] 형태
+            
+            # Permute to [B, 1, D=3, H, W] - depth를 3번째 차원으로
+            # cond_3d는 [B, 1, 3, H, W]이지만 3이 채널이 아닌 depth 역할
+            # 따라서 [B, 3, H, W] -> [B, 1, 3, H, W]에서 
+            # 실제로는 [B, C=1, D=3, H, W]로 해석해야 함
+            # 근데 원래 cond는 [B, 3, H, W]로 3개 슬라이스가 채널로 들어옴
+            # 이를 3D로 바꾸면 [B, 1, D=3, H, W]
+            
+            # cond: [B, 3, H, W] -> cond_3d: [B, 1, D=3, H, W]
+            if cond.dim() == 4 and cond.shape[1] == 3:
+                cond_3d = cond.unsqueeze(1).permute(0, 1, 2, 3, 4)  # 그대로 [B, 1, 3, H, W]
+                # 사실 이미 [B, 3, H, W]에서 unsqueeze(1)하면 [B, 1, 3, H, W]
+                # 여기서 dim=1이 채널(C=1), dim=2가 depth(D=3)
+            elif cond.dim() == 5:
+                cond_3d = cond  # 이미 [B, 1, 3, H, W]
+            else:
+                # 그 외 케이스
+                cond_3d = cond.unsqueeze(1) if cond.dim() == 4 else cond
+            
+            # Latent 해상도(D, h, w)로 리사이즈
+            # x.shape: [B, C*2(self-cond), D=3, h, w]
+            target_size = (x.shape[2], x.shape[3], x.shape[4])  # (D, h, w)
+            cond_3d_resized = F.interpolate(
+                cond_3d, size=target_size,
+                mode='trilinear', align_corners=False
+            )  # [B, 1, D, h, w]
+            
+            # cond_to_latent로 채널 확장
+            cond_lat = self.cond_to_latent(cond_3d_resized)  # [B, cond_concat_channels, D, h, w]
+            
+            # x에 concat
+            x = torch.cat([x, cond_lat], dim=1)
+        
         # Time embedding
         t_emb = self.time_mlp(t)
         
@@ -517,8 +600,10 @@ class ConditionalUNet3D(nn.Module):
         h = self.conv_out(h)
         
         # Final size adjustment if needed
-        if h.shape[2:] != x.shape[2:]:
-            h = F.interpolate(h, size=x.shape[2:], mode='trilinear', align_corners=False)
+        if h.shape[2:] != (x.shape[2] if not self.use_cond_concat else x.shape[2]):
+            # x의 원래 shape을 기준으로 맞춤
+            # self-cond + cond_concat을 제외한 원래 latent shape
+            pass  # 보통 필요 없음
         
         return h
 
